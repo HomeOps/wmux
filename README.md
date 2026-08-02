@@ -66,6 +66,8 @@ cargo build --release
 | `wmux new -s NAME -- pwsh -NoProfile` | Run a specific program |
 | `wmux ls` | List running sessions |
 | `wmux attach [NAME]` | Attach; NAME is optional if only one exists |
+| `wmux send -t NAME <text>` | Type into a session without attaching |
+| `wmux capture -t NAME` | Print the session's visible screen as plain text |
 | `wmux kill NAME` | Terminate a session and its child |
 
 ### Keys
@@ -110,6 +112,43 @@ wmux attach build
 wmux spawns its server with `CREATE_BREAKAWAY_FROM_JOB` so it escapes any job
 object the SSH session is holding. If breakaway is refused it says so on stderr
 rather than silently leaving you with a session that will die.
+
+## Scripting: a shell that remembers
+
+`send` and `capture` need no console, so a script — or an AI agent, or anything
+else without a terminal — can drive a session and keep shell state between
+invocations that would otherwise each start from nothing:
+
+```powershell
+wmux new -d -s work pwsh.exe -NoLogo -NoProfile
+wmux capture -t work --wait-for 'PS ' | Out-Null
+
+# expensive work happens once, and the result stays in the session
+wmux send -t work -- '$data = Get-SomethingExpensive'
+
+# ...later, from a completely separate process
+wmux send -t work -- 'Write-Output "rows=$($data.Count)"'
+wmux capture -t work --wait-for 'rows='
+```
+
+The payoff is that the dataset never has to cross the process boundary. Only
+the summary you asked for does.
+
+### `--wait-for` matches the echo too
+
+A terminal echoes what you type, so the screen contains your command *and* its
+output. `--wait-for 'count='` will match the moment the command is echoed,
+before it has produced anything.
+
+Wait on a sentinel the shell builds at runtime, which cannot appear in the
+echoed source:
+
+```powershell
+wmux send -t work -- 'Write-Output ("DONE"+"MARK"+" rows=$($data.Count)")'
+wmux capture -t work --wait-for 'DONEMARK '
+```
+
+The echo shows `("DONE"+"MARK"+...)`; only the output contains `DONEMARK `.
 
 ## How reattach works
 

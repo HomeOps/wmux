@@ -126,7 +126,7 @@ fn wait_for_screen_text(rx: &Receiver<ServerMsg>, needle: &str, timeout: Duratio
                 }
             }
             Ok(ServerMsg::Exited(code)) => panic!("session exited early with code {code}"),
-            Ok(ServerMsg::InfoReply { .. }) => {}
+            Ok(ServerMsg::InfoReply { .. }) | Ok(ServerMsg::CaptureReply(_)) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 panic!(
@@ -270,6 +270,42 @@ fn output_produced_while_detached_is_still_there_on_reattach() {
         screen.contains(&marker),
         "work done while detached must be visible on reattach"
     );
+}
+
+#[test]
+fn shell_state_persists_across_separate_send_and_capture_calls() {
+    // This is the automation path: no console, no attach. Each send/capture is
+    // an independent connection, exactly as a script or another program would
+    // do it, and the shell's variables have to survive between them.
+    let session = start_session("state");
+
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    wmux::client::send_keys(&session.name, "$demo = 6 * 7\r").expect("assign a variable");
+    // A fresh connection, as if from a completely separate invocation.
+    wmux::client::send_keys(&session.name, "Write-Output \"answer=$demo\"\r")
+        .expect("read the variable back");
+
+    let screen = wmux::client::capture_wait(&session.name, "answer=42", Duration::from_secs(20))
+        .expect("the variable should still be set");
+
+    assert!(
+        screen.contains("answer=42"),
+        "state did not survive between calls; screen was:\n{screen}"
+    );
+}
+
+#[test]
+fn capture_does_not_register_as_an_attached_client() {
+    let session = start_session("captureonly");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    let conn = connect(&session.name);
+    ClientMsg::Info.write_to(&mut &*conn).expect("send info");
+    match ServerMsg::read_from(&mut &*conn).expect("read info reply") {
+        ServerMsg::InfoReply { clients, .. } => assert_eq!(clients, 0),
+        other => panic!("expected an info reply, got {other:?}"),
+    }
 }
 
 #[test]

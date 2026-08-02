@@ -80,6 +80,13 @@ refused we warn on stderr rather than silently downgrading.
 **vt100 takes `(rows, cols)`, ConPTY's `PtySize` is a struct.** Easy to
 transpose. The wire protocol carries `(cols, rows)`.
 
+**`capture --wait-for` matches the echoed command, not just its output.** The
+screen holds both. Waiting on a literal that appears in the text you sent
+returns immediately, before the command has run. Wait on a sentinel the shell
+constructs at runtime — `("DONE"+"MARK"+...)` — so the needle cannot appear in
+the echo. If this keeps biting, the real fix is a `wmux run` that wraps the
+command in generated start/end markers and returns only what is between them.
+
 ## Testing
 
 Unit tests live beside the code. The end-to-end tests in `tests/e2e.rs` spawn

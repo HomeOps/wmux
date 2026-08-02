@@ -26,12 +26,14 @@ mod tag {
     pub const DETACH: u8 = 0x04;
     pub const KILL: u8 = 0x05;
     pub const INFO: u8 = 0x06;
+    pub const CAPTURE: u8 = 0x07;
 
     // server -> client
     pub const REPAINT: u8 = 0x81;
     pub const OUTPUT: u8 = 0x82;
     pub const EXITED: u8 = 0x83;
     pub const INFO_REPLY: u8 = 0x84;
+    pub const CAPTURE_REPLY: u8 = 0x85;
 }
 
 /// A message sent from an attaching client to the session server.
@@ -49,6 +51,11 @@ pub enum ClientMsg {
     Kill,
     /// Request session metadata without attaching.
     Info,
+    /// Request the rendered screen as plain text, without attaching.
+    ///
+    /// This is what makes a session usable from a program that has no console
+    /// of its own: send input, then read back what the shell put on screen.
+    Capture,
 }
 
 /// A message sent from the session server to an attached client.
@@ -67,6 +74,9 @@ pub enum ServerMsg {
         clients: u32,
         command: String,
     },
+    /// Reply to [`ClientMsg::Capture`]: the visible screen, newline separated,
+    /// with escape sequences already resolved.
+    CaptureReply(String),
 }
 
 fn write_frame<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> io::Result<()> {
@@ -127,6 +137,7 @@ impl ClientMsg {
             ClientMsg::Detach => write_frame(w, tag::DETACH, &[]),
             ClientMsg::Kill => write_frame(w, tag::KILL, &[]),
             ClientMsg::Info => write_frame(w, tag::INFO, &[]),
+            ClientMsg::Capture => write_frame(w, tag::CAPTURE, &[]),
         }
     }
 
@@ -145,6 +156,7 @@ impl ClientMsg {
             tag::DETACH => Ok(ClientMsg::Detach),
             tag::KILL => Ok(ClientMsg::Kill),
             tag::INFO => Ok(ClientMsg::Info),
+            tag::CAPTURE => Ok(ClientMsg::Capture),
             other => Err(bad(format!("unknown client frame tag 0x{other:02x}"))),
         }
     }
@@ -167,6 +179,7 @@ impl ServerMsg {
                 payload.extend_from_slice(command.as_bytes());
                 write_frame(w, tag::INFO_REPLY, &payload)
             }
+            ServerMsg::CaptureReply(text) => write_frame(w, tag::CAPTURE_REPLY, text.as_bytes()),
         }
     }
 
@@ -197,6 +210,9 @@ impl ServerMsg {
                     command,
                 })
             }
+            tag::CAPTURE_REPLY => Ok(ServerMsg::CaptureReply(
+                String::from_utf8_lossy(&payload).into_owned(),
+            )),
             other => Err(bad(format!("unknown server frame tag 0x{other:02x}"))),
         }
     }
@@ -232,6 +248,7 @@ mod tests {
         roundtrip_client(ClientMsg::Detach);
         roundtrip_client(ClientMsg::Kill);
         roundtrip_client(ClientMsg::Info);
+        roundtrip_client(ClientMsg::Capture);
     }
 
     #[test]
@@ -245,6 +262,12 @@ mod tests {
             clients: 2,
             command: "pwsh.exe".into(),
         });
+        roundtrip_server(ServerMsg::CaptureReply("PS X:\\> echo hi\nhi\n".into()));
+    }
+
+    #[test]
+    fn capture_reply_survives_non_ascii() {
+        roundtrip_server(ServerMsg::CaptureReply("naïve — ✓ 日本語".into()));
     }
 
     #[test]

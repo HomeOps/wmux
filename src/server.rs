@@ -90,6 +90,12 @@ impl Session {
         parser.screen().contents_formatted()
     }
 
+    /// The visible screen as plain text, for callers with no terminal.
+    fn capture_text(&self) -> String {
+        let parser = self.parser.lock().unwrap();
+        parser.screen().contents()
+    }
+
     fn attach(&self, conn: Arc<PipeConn>) -> u64 {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         self.clients.lock().unwrap().push(Client { id, conn });
@@ -266,6 +272,10 @@ fn serve_client(sess: Arc<Session>, conn: PipeConn) -> Result<()> {
                 ClientMsg::Kill => {
                     let _ = sess.killer.lock().unwrap().kill();
                     return Ok(());
+                }
+                ClientMsg::Capture => {
+                    let text = sess.capture_text();
+                    ServerMsg::CaptureReply(text).write_to(&mut &*conn)?;
                 }
                 ClientMsg::Info => {
                     let (cols, rows) = *sess.size.lock().unwrap();

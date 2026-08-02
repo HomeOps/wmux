@@ -66,6 +66,39 @@ enum Command {
         name: Option<String>,
     },
 
+    /// Send input to a session without attaching to it.
+    ///
+    /// Useful from scripts and other programs that have no console of their
+    /// own. Returns once the session has consumed the input.
+    Send {
+        /// Session name.
+        #[arg(short = 't', long = "session")]
+        name: String,
+
+        /// Do not append Enter to the input.
+        #[arg(long)]
+        no_enter: bool,
+
+        /// Text to type into the session.
+        #[arg(trailing_var_arg = true, required = true)]
+        keys: Vec<String>,
+    },
+
+    /// Print a session's visible screen as plain text.
+    Capture {
+        /// Session name.
+        #[arg(short = 't', long = "session")]
+        name: String,
+
+        /// Poll until this text appears on screen.
+        #[arg(long)]
+        wait_for: Option<String>,
+
+        /// Seconds to wait when --wait-for is given.
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+    },
+
     /// Terminate a session and its child process.
     Kill {
         /// Session name.
@@ -103,6 +136,16 @@ fn run() -> Result<()> {
         } => cmd_new(name, detached, command),
         Command::Ls => cmd_ls(),
         Command::Attach { name } => cmd_attach(name),
+        Command::Send {
+            name,
+            no_enter,
+            keys,
+        } => cmd_send(&name, &keys, no_enter),
+        Command::Capture {
+            name,
+            wait_for,
+            timeout,
+        } => cmd_capture(&name, wait_for.as_deref(), timeout),
         Command::Kill { name } => cmd_kill(&name),
         Command::Server {
             name,
@@ -199,6 +242,26 @@ fn finish_attach(name: &str, outcome: client::Outcome) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn cmd_send(name: &str, keys: &[String], no_enter: bool) -> Result<()> {
+    let mut text = keys.join(" ");
+    if !no_enter {
+        // CR, not LF: that is what a terminal sends for Enter.
+        text.push('\r');
+    }
+    client::send_keys(name, &text)
+}
+
+fn cmd_capture(name: &str, wait_for: Option<&str>, timeout_secs: u64) -> Result<()> {
+    let screen = match wait_for {
+        Some(needle) => {
+            client::capture_wait(name, needle, std::time::Duration::from_secs(timeout_secs))?
+        }
+        None => client::capture(name)?,
+    };
+    println!("{screen}");
+    Ok(())
 }
 
 fn cmd_kill(name: &str) -> Result<()> {

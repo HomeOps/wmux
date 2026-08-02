@@ -171,7 +171,9 @@ fn pump_output(conn: &Arc<PipeConn>, detached: &Arc<AtomicBool>) -> Result<Outco
                 stdout.flush()?;
             }
             Ok(ServerMsg::Exited(code)) => return Ok(Outcome::Exited(code)),
-            Ok(ServerMsg::InfoReply { .. }) => {}
+            // An attached client never asks for these, but ignoring them keeps
+            // the stream in sync if a future version starts pushing them.
+            Ok(ServerMsg::InfoReply { .. }) | Ok(ServerMsg::CaptureReply(_)) => {}
             Err(_) => {
                 // The connection dropped. If we asked to detach, that is the
                 // server acknowledging by closing; otherwise the session died
@@ -251,6 +253,54 @@ pub fn query_info(name: &str) -> Result<ServerMsg> {
     let conn = PipeConn::connect(&path)?;
     ClientMsg::Info.write_to(&mut &conn)?;
     ServerMsg::read_from(&mut &conn).context("session did not answer the info request")
+}
+
+/// Sends literal input to a session without attaching.
+///
+/// The call round-trips a capture afterwards, so it returns only once the
+/// server has actually consumed the bytes and written them to the pty. Without
+/// that handshake a caller that exits immediately could close the pipe before
+/// the input was read.
+pub fn send_keys(name: &str, keys: &str) -> Result<()> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::Input(keys.as_bytes().to_vec()).write_to(&mut &conn)?;
+    ClientMsg::Capture.write_to(&mut &conn)?;
+    match ServerMsg::read_from(&mut &conn)? {
+        ServerMsg::CaptureReply(_) => Ok(()),
+        other => anyhow::bail!("unexpected reply to send: {other:?}"),
+    }
+}
+
+/// Reads back the session's visible screen as plain text.
+pub fn capture(name: &str) -> Result<String> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::Capture.write_to(&mut &conn)?;
+    match ServerMsg::read_from(&mut &conn)? {
+        ServerMsg::CaptureReply(text) => Ok(text),
+        other => anyhow::bail!("unexpected reply to capture: {other:?}"),
+    }
+}
+
+/// Polls `capture` until `needle` appears on screen or the deadline passes.
+///
+/// Automation needs this: after sending a command there is no signal that the
+/// shell has finished with it, and sleeping a guessed interval is both slower
+/// and less reliable than waiting for the output to show up.
+pub fn capture_wait(name: &str, needle: &str, timeout: std::time::Duration) -> Result<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        last = capture(name)?;
+        if last.contains(needle) {
+            return Ok(last);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("{needle:?} did not appear within {timeout:?}; screen was:\n{last}")
 }
 
 /// Asks a session to terminate its child process.
