@@ -22,6 +22,7 @@
 
 pub mod client;
 pub mod console;
+pub mod input;
 pub mod pipe;
 pub mod protocol;
 pub mod run;

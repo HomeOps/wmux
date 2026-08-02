@@ -80,6 +80,13 @@ tmux bindings, so muscle memory carries over:
 | `Ctrl-B` `d` | Detach |
 | `Ctrl-B` `Ctrl-B` | Send a literal Ctrl-B to the session |
 
+Or, without touching the keyboard at all:
+
+```powershell
+wmux detach          # from inside the session
+wmux detach build    # from any other terminal
+```
+
 PSReadLine binds `Ctrl-B` to backward-char, which is the same tradeoff tmux
 users already live with. To rebind:
 
