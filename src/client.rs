@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::console;
 use crate::console::{console_size, RawMode};
+use crate::input::InputParser;
 use crate::pipe::PipeConn;
 use crate::protocol::{ClientMsg, ServerMsg};
 use crate::session;
@@ -81,44 +82,72 @@ pub enum Outcome {
 #[derive(Debug)]
 pub struct DetachDetector {
     prefix: u8,
-    /// True when the previous byte was the prefix and we are waiting to see
-    /// what it modifies.
+    parser: InputParser,
+    /// True once the prefix has been seen and we are waiting for what it
+    /// modifies.
     armed: bool,
+    /// Raw bytes withheld while armed: the prefix itself, plus any key
+    /// releases that arrived before the second key. Replayed verbatim if the
+    /// sequence turns out not to be a detach, so the session sees exactly what
+    /// was typed and in the right order.
+    held: Vec<u8>,
 }
 
 impl DetachDetector {
     pub fn new(prefix: u8) -> Self {
         DetachDetector {
             prefix,
+            parser: InputParser::new(),
             armed: false,
+            held: Vec::new(),
         }
     }
 
-    /// Consumes raw input and returns the bytes to forward to the pty plus
-    /// whether the user asked to detach.
+    /// Consumes raw console input and returns the bytes to forward to the pty
+    /// plus whether the user asked to detach.
     ///
-    /// Pressing the prefix twice forwards a single literal prefix byte, which
-    /// is how you type Ctrl-\ inside a session.
+    /// Input is decoded into key presses first, because Windows Terminal
+    /// delivers keys as win32-input-mode escape sequences rather than plain
+    /// bytes; see [`crate::input`]. Bytes are forwarded exactly as received,
+    /// so whatever encoding the terminal negotiated still reaches the session.
+    ///
+    /// Pressing the prefix twice forwards a single literal prefix, which is
+    /// how you type Ctrl-B inside a session.
     pub fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+        let keys = self.parser.feed(input);
         let mut out = Vec::with_capacity(input.len());
-        for &byte in input {
+
+        for key in keys {
             if self.armed {
-                self.armed = false;
-                if byte == DETACH_KEY || byte == DETACH_KEY.to_ascii_uppercase() {
-                    return (out, true);
+                match key.ch {
+                    // Key releases and other characterless events arrive
+                    // between the prefix and the key it modifies. Hold them
+                    // and stay armed, otherwise releasing Ctrl would cancel
+                    // the binding before 'd' was ever pressed.
+                    None => self.held.extend_from_slice(&key.raw),
+                    Some(c) if c.eq_ignore_ascii_case(&DETACH_KEY) => {
+                        self.armed = false;
+                        self.held.clear();
+                        return (out, true);
+                    }
+                    Some(c) if c == self.prefix => {
+                        // Doubled prefix: emit the first one literally and
+                        // swallow the second.
+                        self.armed = false;
+                        out.append(&mut self.held);
+                    }
+                    Some(_) => {
+                        self.armed = false;
+                        out.append(&mut self.held);
+                        out.extend_from_slice(&key.raw);
+                    }
                 }
-                if byte == self.prefix {
-                    out.push(self.prefix);
-                } else {
-                    // Not a recognised binding: pass the prefix through
-                    // followed by whatever was typed.
-                    out.push(self.prefix);
-                    out.push(byte);
-                }
-            } else if byte == self.prefix {
+            } else if key.ch == Some(self.prefix) {
                 self.armed = true;
+                self.held.clear();
+                self.held.extend_from_slice(&key.raw);
             } else {
-                out.push(byte);
+                out.extend_from_slice(&key.raw);
             }
         }
         (out, false)
@@ -434,6 +463,132 @@ mod tests {
         let (out, detach) = d.feed(&[0x03]);
         assert_eq!(out, vec![0x03]);
         assert!(!detach);
+    }
+
+    // The sequences below were captured from a real Windows Terminal session.
+    // Windows Terminal negotiates win32-input-mode, so keys arrive as escape
+    // sequences rather than bare bytes, which is what broke detaching.
+    const CTRL_DOWN: &[u8] = b"\x1b[17;29;0;1;40;1_";
+    const CTRL_UP: &[u8] = b"\x1b[17;29;0;0;32;1_";
+    const B_DOWN_CTRL: &[u8] = b"\x1b[66;48;2;1;40;1_";
+    const B_UP_CTRL: &[u8] = b"\x1b[66;48;2;0;40;1_";
+    const D_DOWN: &[u8] = b"\x1b[68;32;100;1;32;1_";
+    const D_UP: &[u8] = b"\x1b[68;32;100;0;32;1_";
+
+    #[test]
+    fn win32_input_mode_ctrl_b_then_d_detaches() {
+        let mut d = detector();
+        let mut all = Vec::new();
+        all.extend_from_slice(CTRL_DOWN);
+        all.extend_from_slice(B_DOWN_CTRL);
+        all.extend_from_slice(B_UP_CTRL);
+        all.extend_from_slice(CTRL_UP);
+        all.extend_from_slice(D_DOWN);
+
+        let (forward, detach) = d.feed(&all);
+        assert!(detach, "Ctrl-B then d must detach in win32-input-mode");
+        // The B and d keystrokes must not reach the session.
+        assert!(
+            !contains(&forward, B_DOWN_CTRL),
+            "the prefix leaked to the session"
+        );
+        assert!(!contains(&forward, D_DOWN), "the detach key leaked");
+    }
+
+    #[test]
+    fn win32_input_mode_releases_do_not_cancel_the_prefix() {
+        // The release of Ctrl-B arrives before 'd' is pressed. If that
+        // disarmed the detector, detaching would be impossible.
+        let mut d = detector();
+        let (_, detach) = d.feed(B_DOWN_CTRL);
+        assert!(!detach);
+        let (out, detach) = d.feed(B_UP_CTRL);
+        assert!(!detach, "a key release must not resolve the binding");
+        assert!(out.is_empty(), "the release should be held, not forwarded");
+        let (_, detach) = d.feed(D_DOWN);
+        assert!(detach, "the sequence should still complete");
+    }
+
+    #[test]
+    fn win32_input_mode_ordinary_typing_is_forwarded_verbatim() {
+        let mut d = detector();
+        let (forward, detach) = d.feed(D_DOWN);
+        assert!(!detach);
+        assert_eq!(
+            forward,
+            D_DOWN.to_vec(),
+            "keys the session should see must pass through byte for byte"
+        );
+    }
+
+    #[test]
+    fn win32_input_mode_prefix_then_unbound_key_replays_both() {
+        let mut d = detector();
+        let mut all = Vec::new();
+        all.extend_from_slice(B_DOWN_CTRL);
+        all.extend_from_slice(B_UP_CTRL);
+        // 'x' is not a binding, so the whole thing must reach the session.
+        let x_down = b"\x1b[88;45;120;1;32;1_";
+        all.extend_from_slice(x_down);
+
+        let (forward, detach) = d.feed(&all);
+        assert!(!detach);
+        assert!(contains(&forward, B_DOWN_CTRL), "prefix should be replayed");
+        assert!(contains(&forward, x_down), "the key should be replayed");
+        let prefix_at = find(&forward, B_DOWN_CTRL).unwrap();
+        let x_at = find(&forward, x_down).unwrap();
+        assert!(prefix_at < x_at, "replay must preserve typing order");
+    }
+
+    #[test]
+    fn win32_input_mode_doubled_prefix_sends_one_literal() {
+        let mut d = detector();
+        let mut all = Vec::new();
+        all.extend_from_slice(B_DOWN_CTRL);
+        all.extend_from_slice(B_UP_CTRL);
+        all.extend_from_slice(B_DOWN_CTRL);
+
+        let (forward, detach) = d.feed(&all);
+        assert!(!detach);
+        assert_eq!(
+            count(&forward, B_DOWN_CTRL),
+            1,
+            "exactly one literal prefix should reach the session"
+        );
+    }
+
+    #[test]
+    fn win32_input_mode_uppercase_d_also_detaches() {
+        let mut d = detector();
+        d.feed(B_DOWN_CTRL);
+        // Shift-D: char 68 = 'D'.
+        let (_, detach) = d.feed(b"\x1b[68;32;68;1;48;1_");
+        assert!(detach);
+    }
+
+    #[test]
+    fn win32_input_mode_key_up_of_d_alone_does_nothing() {
+        let mut d = detector();
+        let (forward, detach) = d.feed(D_UP);
+        assert!(!detach);
+        assert_eq!(forward, D_UP.to_vec());
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        find(haystack, needle).is_some()
+    }
+
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
     }
 
     #[test]
