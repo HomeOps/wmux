@@ -388,6 +388,105 @@ fn run_reports_a_failing_command_without_killing_the_session() {
 }
 
 #[test]
+fn ctrl_b_then_d_is_intercepted_by_the_client_not_the_session() {
+    // A session's ConPTY *is* a real console, so wmux can host its own client
+    // and exercise the whole key path: input bytes -> conhost key records ->
+    // ENABLE_VIRTUAL_TERMINAL_INPUT translation -> the client's read.
+    //
+    // This regression exists because the client originally read through
+    // `std::io::stdin()`, which on Windows goes via `ReadConsoleW` — the
+    // legacy console path that does not deliver VT input. The prefix fell
+    // straight through to the session, where PSReadLine treated Ctrl-B as
+    // backward-char, and detaching was impossible.
+    let inner = start_session("kbinner");
+    let outer = start_session("kbouter");
+
+    wmux::client::capture_wait(&inner.name, "PS ", SHELL_TIMEOUT).expect("inner shell");
+    wmux::client::capture_wait(&outer.name, "PS ", SHELL_TIMEOUT).expect("outer shell");
+
+    // Split at the source so the marker only ever appears in *output*, never
+    // in the echoed command.
+    let marker = format!("KBMARK{}", std::process::id());
+    let (head, tail) = marker.split_at(6);
+    wmux::client::send_keys(
+        &inner.name,
+        &format!("Write-Output ('{head}' + '{tail}')\r"),
+    )
+    .expect("mark inner");
+    wmux::client::capture_wait(&inner.name, &marker, Duration::from_secs(30))
+        .expect("inner should show its marker");
+
+    // Attach to inner from inside outer.
+    let exe = wmux_exe();
+    wmux::client::send_keys(
+        &outer.name,
+        &format!("& '{}' attach {}\r", exe.display(), inner.name),
+    )
+    .expect("start attach inside outer");
+
+    // Outer's screen is now inner's screen, which proves the repaint landed.
+    wmux::client::capture_wait(&outer.name, &marker, Duration::from_secs(45))
+        .expect("attaching should repaint inner's screen onto outer");
+
+    // The actual test: Ctrl-B, then d.
+    wmux::client::send_keys(&outer.name, "\u{2}d").expect("send the detach sequence");
+
+    let screen = wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
+        .expect("the prefix must be intercepted by the client, not forwarded to the session");
+    assert!(
+        screen.contains("[detached from"),
+        "expected a detach notice, got:\n{screen}"
+    );
+
+    assert!(
+        session::session_exists(&inner.name).expect("list sessions"),
+        "detaching must leave the session running"
+    );
+}
+
+#[test]
+fn a_lone_prefix_is_swallowed_rather_than_reaching_the_shell() {
+    // If the prefix leaked through, PSReadLine would act on it. Sending the
+    // prefix followed by Enter must leave the command line untouched, so the
+    // shell just sees a bare Enter and redraws its prompt.
+    let inner = start_session("kbsolo");
+    let outer = start_session("kbsoloout");
+
+    wmux::client::capture_wait(&inner.name, "PS ", SHELL_TIMEOUT).expect("inner shell");
+    wmux::client::capture_wait(&outer.name, "PS ", SHELL_TIMEOUT).expect("outer shell");
+
+    // Mark inner so we can tell its screen from outer's. Waiting on "PS "
+    // would match outer's *own* prompt and race ahead of the attach.
+    let marker = format!("SOLOMARK{}", std::process::id());
+    let (head, tail) = marker.split_at(8);
+    wmux::client::send_keys(
+        &inner.name,
+        &format!("Write-Output ('{head}' + '{tail}')\r"),
+    )
+    .expect("mark inner");
+    wmux::client::capture_wait(&inner.name, &marker, Duration::from_secs(30))
+        .expect("inner should show its marker");
+
+    let exe = wmux_exe();
+    wmux::client::send_keys(
+        &outer.name,
+        &format!("& '{}' attach {}\r", exe.display(), inner.name),
+    )
+    .expect("start attach inside outer");
+    wmux::client::capture_wait(&outer.name, &marker, Duration::from_secs(45))
+        .expect("attach should repaint inner's screen onto outer");
+
+    // A lone prefix arms the detector and forwards nothing.
+    wmux::client::send_keys(&outer.name, "\u{2}").expect("send a bare prefix");
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Then 'd' completes the sequence even though it arrived in a later read.
+    wmux::client::send_keys(&outer.name, "d").expect("complete the sequence");
+    wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
+        .expect("a prefix split across reads must still detach");
+}
+
+#[test]
 fn killing_a_session_removes_it() {
     let session = start_session("kill");
     assert!(session::session_exists(&session.name).unwrap());

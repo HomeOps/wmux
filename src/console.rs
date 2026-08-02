@@ -110,6 +110,11 @@ impl RawMode {
                 );
             }
 
+            crate::server::log(&format!(
+                "console: input mode 0x{previous_input:08x} -> 0x{input_mode:08x}, \
+                 output mode 0x{previous_output:08x} -> 0x{output_mode:08x}"
+            ));
+
             Ok(RawMode {
                 stdin,
                 stdout,
@@ -128,6 +133,42 @@ impl Drop for RawMode {
             SetConsoleMode(self.stdout, self.previous_output);
         }
     }
+}
+
+/// Reads raw bytes from the console input handle.
+///
+/// Deliberately **not** `std::io::stdin()`. Rust's Windows implementation reads
+/// through `ReadConsoleW` and decodes UTF-16, which is the legacy console input
+/// path: it yields characters produced by the console's own key translation.
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT` delivers its escape sequences through
+/// `ReadFile`, so control keys such as Ctrl-B only arrive intact on this path.
+///
+/// Reading the wrong way is why the detach prefix used to fall through to the
+/// session instead of being intercepted by the client.
+#[cfg(windows)]
+pub fn read_console_input(buf: &mut [u8]) -> std::io::Result<usize> {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+
+    unsafe {
+        let stdin = GetStdHandle(STD_INPUT_HANDLE);
+        let mut read: u32 = 0;
+        let ok = ReadFile(
+            stdin,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut read,
+            std::ptr::null_mut(),
+        );
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(read as usize)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn read_console_input(_buf: &mut [u8]) -> std::io::Result<usize> {
+    Err(std::io::Error::other("wmux only runs on Windows"))
 }
 
 /// Current size of the console window (not the scrollback buffer).

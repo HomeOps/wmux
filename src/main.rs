@@ -132,6 +132,13 @@ enum Command {
         name: String,
     },
 
+    /// Diagnostic: show the raw bytes the console delivers for each keypress.
+    ///
+    /// Use this when a key binding is not being recognised. It reads the
+    /// console exactly the way `wmux attach` does, so whatever it prints is
+    /// what the detach detector sees.
+    Keys,
+
     /// Internal: run the session server in this process.
     #[command(hide = true)]
     Server {
@@ -181,6 +188,7 @@ fn run() -> Result<()> {
             timeout,
         } => cmd_capture(&name, wait_for.as_deref(), timeout),
         Command::Kill { name } => cmd_kill(&name),
+        Command::Keys => cmd_keys(),
         Command::Server {
             name,
             cols,
@@ -323,6 +331,58 @@ fn cmd_capture(name: &str, wait_for: Option<&str>, timeout_secs: u64) -> Result<
 fn cmd_kill(name: &str) -> Result<()> {
     client::kill(name)?;
     println!("[killed {name}]");
+    Ok(())
+}
+
+fn cmd_keys() -> Result<()> {
+    use std::io::Write;
+
+    let prefix = client::configured_prefix();
+    println!("wmux keys — press keys to see the bytes wmux receives.");
+    println!(
+        "prefix is 0x{prefix:02x} (Ctrl-{}); press it then 'd' to detach when attached.",
+        (prefix + b'@') as char
+    );
+    println!("Ctrl-Q quits.\n");
+
+    let _raw = console::RawMode::enter()?;
+    let mut stdout = std::io::stdout();
+    let mut buf = [0u8; 256];
+
+    loop {
+        let n = console::read_console_input(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let bytes = &buf[..n];
+        let hex = bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let printable: String = bytes
+            .iter()
+            .map(|b| {
+                if (0x20..0x7f).contains(b) {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        let note = if bytes.contains(&prefix) {
+            "  <- prefix seen"
+        } else {
+            ""
+        };
+        // \r\n because the console is in raw mode.
+        write!(stdout, "  {hex:<40} {printable}{note}\r\n")?;
+        stdout.flush()?;
+
+        if bytes.contains(&0x11) {
+            break;
+        }
+    }
     Ok(())
 }
 

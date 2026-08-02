@@ -94,6 +94,34 @@ temp file and touches a separate completion marker; wmux polls for the marker
 so it can never read a half-flushed payload. Keep that ordering — the marker is
 written *after* the payload, and there is a test asserting it.
 
+**Never read console input with `std::io::stdin()`.** Rust's Windows
+implementation goes through `ReadConsoleW`, the legacy console path, which does
+not deliver `ENABLE_VIRTUAL_TERMINAL_INPUT` bytes. The Ctrl-B prefix fell
+straight through to the session, PSReadLine treated it as backward-char, and
+detaching was impossible. Use `console::read_console_input`, which calls
+`ReadFile` on the console handle — the documented path for VT input.
+`ctrl_b_then_d_is_intercepted_by_the_client_not_the_session` guards this.
+
+**A session's ConPTY is a real console, so wmux can test its own client.**
+Attach to session B from inside session A and drive it with `send`. ConPTY
+converts the injected bytes into key records and the client reads them back
+through the full translation path, so this exercises key handling rather than
+just the byte plumbing. This is the only way to test `attach` without a TTY.
+
+**When testing nested sessions, never synchronise on `"PS "`.** The outer
+session's own prompt matches it, so the test races ahead of the attach. Mark
+the inner session with a runtime-built string and wait for *that*.
+
+**Broadcast must never write to a pipe from the pty pump thread.** A client
+that stops reading fills the 64 KB pipe buffer and the blocking write freezes
+output for every client. Each client owns a bounded queue drained by its own
+writer thread, and one that fills its queue is dropped.
+
+**`wmux new` looks like it hangs from a test harness.** The detached server
+outlives the command, so a harness that waits on the whole process tree blocks
+until timeout. Not a bug: invoke via `Start-Process -PassThru
+-RedirectStandardOutput` and it returns in milliseconds.
+
 **`run` delivers one line of keystrokes.** A newline would submit the command
 early, so the wrapper must stay single-line and `run` rejects a multi-line
 command. Paths interpolated into it go through `ps_single_quote`, which doubles
