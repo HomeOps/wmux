@@ -106,6 +106,35 @@ pub fn session_exists(name: &str) -> Result<bool> {
     Ok(list_sessions()?.iter().any(|n| n == name))
 }
 
+/// Environment variable the server sets inside every session, naming it.
+///
+/// Anything running in a session inherits this, which is how commands like
+/// `wmux detach` can tell which session they are inside without being told.
+pub const SESSION_ENV: &str = "WMUX_SESSION";
+
+/// Resolves which session a command should act on.
+///
+/// An explicit name always wins. Otherwise fall back to the session the caller
+/// is running inside, and fail with something actionable if it is neither.
+pub fn resolve_target(explicit: Option<String>, from_env: Option<String>) -> Result<String> {
+    if let Some(name) = explicit {
+        validate_name(&name)?;
+        return Ok(name);
+    }
+    match from_env {
+        Some(name) if !name.trim().is_empty() => {
+            let name = name.trim().to_string();
+            validate_name(&name)?;
+            Ok(name)
+        }
+        _ => bail!(
+            "not running inside a wmux session, so there is nothing to detach.\n\
+             Name a session explicitly, for example `wmux detach build`, or run \
+             `wmux ls` to see what is running."
+        ),
+    }
+}
+
 /// Generates the next free `wmux-N` style name.
 pub fn next_free_name() -> Result<String> {
     let existing = list_sessions().unwrap_or_default();
@@ -230,6 +259,41 @@ mod tests {
     fn leaf_from_another_user_is_ignored() {
         let leaf = pipe_leaf_for("S-1-5-21-9-9-9-500", "build");
         assert_eq!(session_name_from_leaf(SID, &leaf), None);
+    }
+
+    #[test]
+    fn an_explicit_name_wins_over_the_environment() {
+        let got = resolve_target(Some("chosen".into()), Some("ambient".into())).unwrap();
+        assert_eq!(got, "chosen");
+    }
+
+    #[test]
+    fn the_ambient_session_is_used_when_no_name_is_given() {
+        let got = resolve_target(None, Some("ambient".into())).unwrap();
+        assert_eq!(got, "ambient");
+    }
+
+    #[test]
+    fn surrounding_whitespace_in_the_environment_is_ignored() {
+        let got = resolve_target(None, Some("  ambient \n".into())).unwrap();
+        assert_eq!(got, "ambient");
+    }
+
+    #[test]
+    fn outside_a_session_with_no_name_is_an_actionable_error() {
+        for env in [None, Some(String::new()), Some("   ".into())] {
+            let err = resolve_target(None, env).unwrap_err().to_string();
+            assert!(
+                err.contains("not running inside a wmux session"),
+                "unhelpful error: {err}"
+            );
+            assert!(err.contains("wmux ls"), "should point somewhere: {err}");
+        }
+    }
+
+    #[test]
+    fn a_bogus_ambient_session_name_is_rejected() {
+        assert!(resolve_target(None, Some("../evil".into())).is_err());
     }
 
     #[test]

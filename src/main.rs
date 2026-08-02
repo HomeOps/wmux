@@ -132,12 +132,15 @@ enum Command {
         name: String,
     },
 
-    /// Detach whatever is attached to a session, from another terminal.
+    /// Detach the terminal viewing a session, leaving the session running.
     ///
-    /// Use this when the prefix key is not usable. The session keeps running.
+    /// With no arguments this detaches the session you are currently inside,
+    /// so `wmux detach` typed at a session's own prompt does the same thing as
+    /// the prefix key. Naming a session detaches it from another terminal,
+    /// which is the way out when the prefix key is not usable.
     Detach {
-        /// Session name.
-        name: String,
+        /// Session name. Defaults to the session this command runs inside.
+        name: Option<String>,
     },
 
     /// Diagnostic: show the raw bytes the console delivers for each keypress.
@@ -196,7 +199,7 @@ fn run() -> Result<()> {
             timeout,
         } => cmd_capture(&name, wait_for.as_deref(), timeout),
         Command::Kill { name } => cmd_kill(&name),
-        Command::Detach { name } => cmd_detach(&name),
+        Command::Detach { name } => cmd_detach(name),
         Command::Keys => cmd_keys(),
         Command::Server {
             name,
@@ -343,8 +346,9 @@ fn cmd_kill(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_detach(name: &str) -> Result<()> {
-    client::detach_clients(name)?;
+fn cmd_detach(name: Option<String>) -> Result<()> {
+    let name = session::resolve_target(name, std::env::var(session::SESSION_ENV).ok())?;
+    client::detach_clients(&name)?;
     println!("[detached {name}]");
     Ok(())
 }

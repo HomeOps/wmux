@@ -166,7 +166,7 @@ pub fn run(name: &str, command: &[String], cols: u16, rows: u16) -> Result<()> {
     }
     // Let programs inside the session know they are hosted by wmux, and give
     // them a terminal type that implies VT support.
-    builder.env("WMUX_SESSION", name);
+    builder.env(session::SESSION_ENV, name);
     builder.env("TERM", "xterm-256color");
 
     let child = pair

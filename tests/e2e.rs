@@ -527,6 +527,46 @@ fn detach_from_outside_works_without_any_keyboard() {
 }
 
 #[test]
+fn bare_wmux_detach_inside_a_session_detaches_it() {
+    // Typing `wmux detach` at a session's own prompt should do what the prefix
+    // key does. The session server exports WMUX_SESSION, so the command can
+    // work out which session it is inside without being told.
+    let inner = start_session("selfinner");
+    let outer = start_session("selfouter");
+
+    wmux::client::capture_wait(&inner.name, "PS ", SHELL_TIMEOUT).expect("inner shell");
+    wmux::client::capture_wait(&outer.name, "PS ", SHELL_TIMEOUT).expect("outer shell");
+
+    let marker = format!("SELFMARK{}", std::process::id());
+    let (head, tail) = marker.split_at(8);
+    wmux::client::send_keys(
+        &inner.name,
+        &format!("Write-Output ('{head}' + '{tail}')\r"),
+    )
+    .expect("mark inner");
+    wmux::client::capture_wait(&inner.name, &marker, Duration::from_secs(30)).expect("marked");
+
+    let exe = wmux_exe();
+    wmux::client::send_keys(
+        &outer.name,
+        &format!("& '{}' attach {}\r", exe.display(), inner.name),
+    )
+    .expect("attach from outer");
+    wmux::client::capture_wait(&outer.name, &marker, Duration::from_secs(45)).expect("attached");
+
+    // Typed *into the session*, with no session name given.
+    wmux::client::send_keys(&inner.name, &format!("& '{}' detach\r", exe.display()))
+        .expect("run bare detach inside the session");
+
+    wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
+        .expect("a bare `wmux detach` inside a session should detach its viewer");
+    assert!(
+        session::session_exists(&inner.name).expect("list sessions"),
+        "the session must keep running"
+    );
+}
+
+#[test]
 fn killing_a_session_removes_it() {
     let session = start_session("kill");
     assert!(session::session_exists(&session.name).unwrap());
