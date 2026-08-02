@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use wmux::{client, console, protocol, server, session};
+use wmux::{client, console, protocol, run, server, session};
 
 /// Creation flags for the detached server process.
 ///
@@ -66,11 +66,89 @@ enum Command {
         name: Option<String>,
     },
 
+    /// Send input to a session without attaching to it.
+    ///
+    /// Useful from scripts and other programs that have no console of their
+    /// own. Returns once the session has consumed the input.
+    Send {
+        /// Session name.
+        #[arg(short = 't', long = "session")]
+        name: String,
+
+        /// Do not append Enter to the input.
+        #[arg(long)]
+        no_enter: bool,
+
+        /// Text to type into the session.
+        #[arg(trailing_var_arg = true, required = true)]
+        keys: Vec<String>,
+    },
+
+    /// Run a command in a PowerShell session and print its serialised result.
+    ///
+    /// Unlike `capture`, the result does not travel over the terminal: the
+    /// session writes it to a temporary file, so it is neither wrapped to the
+    /// terminal width nor limited to what fits on screen.
+    Run {
+        /// Session name.
+        #[arg(short = 't', long = "session")]
+        name: String,
+
+        /// Serialisation format: clixml, json, or text.
+        #[arg(long, default_value = "clixml")]
+        format: run::Format,
+
+        /// Serialisation depth for clixml and json.
+        #[arg(long, default_value_t = 8)]
+        depth: u32,
+
+        /// Seconds to wait for the command to finish.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+
+        /// The PowerShell command to run.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+
+    /// Print a session's visible screen as plain text.
+    Capture {
+        /// Session name.
+        #[arg(short = 't', long = "session")]
+        name: String,
+
+        /// Poll until this text appears on screen.
+        #[arg(long)]
+        wait_for: Option<String>,
+
+        /// Seconds to wait when --wait-for is given.
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+    },
+
     /// Terminate a session and its child process.
     Kill {
         /// Session name.
         name: String,
     },
+
+    /// Detach the terminal viewing a session, leaving the session running.
+    ///
+    /// With no arguments this detaches the session you are currently inside,
+    /// so `wmux detach` typed at a session's own prompt does the same thing as
+    /// the prefix key. Naming a session detaches it from another terminal,
+    /// which is the way out when the prefix key is not usable.
+    Detach {
+        /// Session name. Defaults to the session this command runs inside.
+        name: Option<String>,
+    },
+
+    /// Diagnostic: show the raw bytes the console delivers for each keypress.
+    ///
+    /// Use this when a key binding is not being recognised. It reads the
+    /// console exactly the way `wmux attach` does, so whatever it prints is
+    /// what the detach detector sees.
+    Keys,
 
     /// Internal: run the session server in this process.
     #[command(hide = true)]
@@ -103,7 +181,26 @@ fn run() -> Result<()> {
         } => cmd_new(name, detached, command),
         Command::Ls => cmd_ls(),
         Command::Attach { name } => cmd_attach(name),
+        Command::Send {
+            name,
+            no_enter,
+            keys,
+        } => cmd_send(&name, &keys, no_enter),
+        Command::Run {
+            name,
+            format,
+            depth,
+            timeout,
+            command,
+        } => cmd_run(&name, &command, format, depth, timeout),
+        Command::Capture {
+            name,
+            wait_for,
+            timeout,
+        } => cmd_capture(&name, wait_for.as_deref(), timeout),
         Command::Kill { name } => cmd_kill(&name),
+        Command::Detach { name } => cmd_detach(name),
+        Command::Keys => cmd_keys(),
         Command::Server {
             name,
             cols,
@@ -201,9 +298,110 @@ fn finish_attach(name: &str, outcome: client::Outcome) -> Result<()> {
     }
 }
 
+fn cmd_send(name: &str, keys: &[String], no_enter: bool) -> Result<()> {
+    let mut text = keys.join(" ");
+    if !no_enter {
+        // CR, not LF: that is what a terminal sends for Enter.
+        text.push('\r');
+    }
+    client::send_keys(name, &text)
+}
+
+fn cmd_run(
+    name: &str,
+    command: &[String],
+    format: run::Format,
+    depth: u32,
+    timeout_secs: u64,
+) -> Result<()> {
+    let command = command.join(" ");
+    let output = run::run(
+        name,
+        &command,
+        format,
+        depth,
+        std::time::Duration::from_secs(timeout_secs),
+    )?;
+    print!("{output}");
+    if !output.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+fn cmd_capture(name: &str, wait_for: Option<&str>, timeout_secs: u64) -> Result<()> {
+    let screen = match wait_for {
+        Some(needle) => {
+            client::capture_wait(name, needle, std::time::Duration::from_secs(timeout_secs))?
+        }
+        None => client::capture(name)?,
+    };
+    println!("{screen}");
+    Ok(())
+}
+
 fn cmd_kill(name: &str) -> Result<()> {
     client::kill(name)?;
     println!("[killed {name}]");
+    Ok(())
+}
+
+fn cmd_detach(name: Option<String>) -> Result<()> {
+    let name = session::resolve_target(name, std::env::var(session::SESSION_ENV).ok())?;
+    client::detach_clients(&name)?;
+    println!("[detached {name}]");
+    Ok(())
+}
+
+fn cmd_keys() -> Result<()> {
+    use std::io::Write;
+
+    let prefix = client::configured_prefix();
+    println!("wmux keys — press keys to see the bytes wmux receives.");
+    println!(
+        "prefix is 0x{prefix:02x} (Ctrl-{}); press it then 'd' to detach when attached.",
+        (prefix + b'@') as char
+    );
+    println!("Ctrl-Q quits.\n");
+
+    let _raw = console::RawMode::enter()?;
+    let mut stdout = std::io::stdout();
+    let mut buf = [0u8; 256];
+
+    loop {
+        let n = console::read_console_input(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let bytes = &buf[..n];
+        let hex = bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let printable: String = bytes
+            .iter()
+            .map(|b| {
+                if (0x20..0x7f).contains(b) {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        let note = if bytes.contains(&prefix) {
+            "  <- prefix seen"
+        } else {
+            ""
+        };
+        // \r\n because the console is in raw mode.
+        write!(stdout, "  {hex:<40} {printable}{note}\r\n")?;
+        stdout.flush()?;
+
+        if bytes.contains(&0x11) {
+            break;
+        }
+    }
     Ok(())
 }
 

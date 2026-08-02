@@ -25,9 +25,17 @@ const SCROLLBACK_LINES: usize = 10_000;
 /// Read chunk for pty output.
 const PTY_CHUNK: usize = 8 * 1024;
 
+/// How many messages may be queued for a client before it is considered stuck.
+///
+/// A client that cannot keep up is dropped rather than allowed to stall the
+/// session. Writing straight to the pipe from the pty pump would block once the
+/// 64 KB pipe buffer filled, freezing output for *every* client and wedging the
+/// session — which is exactly what happened before this queue existed.
+const OUTBOUND_QUEUE: usize = 1024;
+
 struct Client {
     id: u64,
-    conn: Arc<PipeConn>,
+    outbound: std::sync::mpsc::SyncSender<ServerMsg>,
 }
 
 struct Session {
@@ -42,23 +50,23 @@ struct Session {
 }
 
 impl Session {
-    /// Sends a message to every attached client, dropping any that have gone.
+    /// Queues a message for every attached client.
+    ///
+    /// Never blocks: each client owns a bounded queue drained by its own
+    /// writer thread. A client that fills its queue is dropped, because one
+    /// unresponsive terminal must not be able to freeze the session.
     fn broadcast(&self, msg: &ServerMsg) {
-        // Clone the handle list and release the lock before doing any I/O:
-        // writing to a pipe can block, and holding the lock across that would
-        // stall attach and detach for everyone else.
-        let snapshot: Vec<(u64, Arc<PipeConn>)> = {
-            let clients = self.clients.lock().unwrap();
-            clients.iter().map(|c| (c.id, c.conn.clone())).collect()
-        };
-
         let mut dead = Vec::new();
-        for (id, conn) in snapshot {
-            if msg.write_to(&mut &*conn).is_err() {
-                dead.push(id);
+        {
+            let clients = self.clients.lock().unwrap();
+            for client in clients.iter() {
+                if client.outbound.try_send(msg.clone()).is_err() {
+                    dead.push(client.id);
+                }
             }
         }
         if !dead.is_empty() {
+            log(&format!("dropping unresponsive clients: {dead:?}"));
             let mut clients = self.clients.lock().unwrap();
             clients.retain(|c| !dead.contains(&c.id));
         }
@@ -90,9 +98,27 @@ impl Session {
         parser.screen().contents_formatted()
     }
 
+    /// The visible screen as plain text, for callers with no terminal.
+    fn capture_text(&self) -> String {
+        let parser = self.parser.lock().unwrap();
+        parser.screen().contents()
+    }
+
     fn attach(&self, conn: Arc<PipeConn>) -> u64 {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
-        self.clients.lock().unwrap().push(Client { id, conn });
+        let (outbound, inbox) = std::sync::mpsc::sync_channel::<ServerMsg>(OUTBOUND_QUEUE);
+
+        // One writer thread per client. Blocking here only ever affects the
+        // client that is not reading.
+        std::thread::spawn(move || {
+            while let Ok(msg) = inbox.recv() {
+                if msg.write_to(&mut &*conn).is_err() {
+                    break;
+                }
+            }
+        });
+
+        self.clients.lock().unwrap().push(Client { id, outbound });
         id
     }
 
@@ -140,7 +166,7 @@ pub fn run(name: &str, command: &[String], cols: u16, rows: u16) -> Result<()> {
     }
     // Let programs inside the session know they are hosted by wmux, and give
     // them a terminal type that implies VT support.
-    builder.env("WMUX_SESSION", name);
+    builder.env(session::SESSION_ENV, name);
     builder.env("TERM", "xterm-256color");
 
     let child = pair
@@ -228,8 +254,8 @@ fn spawn_child_reaper(sess: Arc<Session>, mut child: Box<dyn portable_pty::Child
             }
         };
         sess.broadcast(&ServerMsg::Exited(code));
-        // Give the broadcast a moment to drain before the pipe disappears.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Let the per-client writer threads drain before the pipe disappears.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         std::process::exit(code);
     });
 }
@@ -266,6 +292,19 @@ fn serve_client(sess: Arc<Session>, conn: PipeConn) -> Result<()> {
                 ClientMsg::Kill => {
                     let _ = sess.killer.lock().unwrap().kill();
                     return Ok(());
+                }
+                ClientMsg::DetachClients => {
+                    let n = sess.client_count();
+                    log(&format!("detaching {n} client(s) on request"));
+                    sess.broadcast(&ServerMsg::Detached);
+                    // Let the writer threads deliver the notice before the
+                    // client list is torn down.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    sess.clients.lock().unwrap().clear();
+                }
+                ClientMsg::Capture => {
+                    let text = sess.capture_text();
+                    ServerMsg::CaptureReply(text).write_to(&mut &*conn)?;
                 }
                 ClientMsg::Info => {
                     let (cols, rows) = *sess.size.lock().unwrap();

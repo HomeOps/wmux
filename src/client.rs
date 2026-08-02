@@ -10,10 +10,11 @@
 //! OpenSSH session from another machine.
 
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::console;
 use crate::console::{console_size, RawMode};
 use crate::pipe::PipeConn;
 use crate::protocol::{ClientMsg, ServerMsg};
@@ -171,7 +172,11 @@ fn pump_output(conn: &Arc<PipeConn>, detached: &Arc<AtomicBool>) -> Result<Outco
                 stdout.flush()?;
             }
             Ok(ServerMsg::Exited(code)) => return Ok(Outcome::Exited(code)),
-            Ok(ServerMsg::InfoReply { .. }) => {}
+            // Someone ran `wmux detach` from outside.
+            Ok(ServerMsg::Detached) => return Ok(Outcome::Detached),
+            // An attached client never asks for these, but ignoring them keeps
+            // the stream in sync if a future version starts pushing them.
+            Ok(ServerMsg::InfoReply { .. }) | Ok(ServerMsg::CaptureReply(_)) => {}
             Err(_) => {
                 // The connection dropped. If we asked to detach, that is the
                 // server acknowledging by closing; otherwise the session died
@@ -190,18 +195,41 @@ fn pump_output(conn: &Arc<PipeConn>, detached: &Arc<AtomicBool>) -> Result<Outco
 fn spawn_input_pump(conn: Arc<PipeConn>, detached: Arc<AtomicBool>, finished: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut detector = DetachDetector::new(configured_prefix());
-        let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1024];
         loop {
             if finished.load(Ordering::SeqCst) {
                 return;
             }
-            let n = match stdin.read(&mut buf) {
-                Ok(0) => return,
+            // Reads the console handle directly rather than going through
+            // std::io::stdin(); see console::read_console_input for why.
+            let n = match console::read_console_input(&mut buf) {
+                Ok(0) => {
+                    crate::server::log("input: console returned EOF");
+                    return;
+                }
                 Ok(n) => n,
-                Err(_) => return,
+                Err(e) => {
+                    crate::server::log(&format!("input: read failed: {e}"));
+                    return;
+                }
             };
+            // With WMUX_LOG set this records exactly what the console handed
+            // us, which is the only way to tell a key-translation problem from
+            // a detector problem without a debugger attached to a live TTY.
+            crate::server::log(&format!(
+                "input: {n} bytes [{}] prefix=0x{:02x}",
+                buf[..n]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                configured_prefix()
+            ));
+
             let (forward, detach) = detector.feed(&buf[..n]);
+            if detach {
+                crate::server::log("input: detach sequence recognised");
+            }
             if !forward.is_empty() && ClientMsg::Input(forward).write_to(&mut &*conn).is_err() {
                 return;
             }
@@ -251,6 +279,70 @@ pub fn query_info(name: &str) -> Result<ServerMsg> {
     let conn = PipeConn::connect(&path)?;
     ClientMsg::Info.write_to(&mut &conn)?;
     ServerMsg::read_from(&mut &conn).context("session did not answer the info request")
+}
+
+/// Sends literal input to a session without attaching.
+///
+/// The call round-trips a capture afterwards, so it returns only once the
+/// server has actually consumed the bytes and written them to the pty. Without
+/// that handshake a caller that exits immediately could close the pipe before
+/// the input was read.
+pub fn send_keys(name: &str, keys: &str) -> Result<()> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::Input(keys.as_bytes().to_vec()).write_to(&mut &conn)?;
+    ClientMsg::Capture.write_to(&mut &conn)?;
+    match ServerMsg::read_from(&mut &conn)? {
+        ServerMsg::CaptureReply(_) => Ok(()),
+        other => anyhow::bail!("unexpected reply to send: {other:?}"),
+    }
+}
+
+/// Reads back the session's visible screen as plain text.
+pub fn capture(name: &str) -> Result<String> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::Capture.write_to(&mut &conn)?;
+    match ServerMsg::read_from(&mut &conn)? {
+        ServerMsg::CaptureReply(text) => Ok(text),
+        other => anyhow::bail!("unexpected reply to capture: {other:?}"),
+    }
+}
+
+/// Polls `capture` until `needle` appears on screen or the deadline passes.
+///
+/// Automation needs this: after sending a command there is no signal that the
+/// shell has finished with it, and sleeping a guessed interval is both slower
+/// and less reliable than waiting for the output to show up.
+pub fn capture_wait(name: &str, needle: &str, timeout: std::time::Duration) -> Result<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        last = capture(name)?;
+        if last.contains(needle) {
+            return Ok(last);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("{needle:?} did not appear within {timeout:?}; screen was:\n{last}")
+}
+
+/// Detaches every client attached to a session, from outside it.
+///
+/// The escape hatch for when the prefix key cannot be used: swallowed by the
+/// terminal emulator, remapped, or simply not working. Run it from any other
+/// terminal and the attached client returns to its shell.
+pub fn detach_clients(name: &str) -> Result<()> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::DetachClients.write_to(&mut &conn)?;
+    // Round-trip so we return only once the server has acted on it.
+    ClientMsg::Capture.write_to(&mut &conn)?;
+    let _ = ServerMsg::read_from(&mut &conn)?;
+    Ok(())
 }
 
 /// Asks a session to terminate its child process.

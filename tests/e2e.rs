@@ -126,7 +126,9 @@ fn wait_for_screen_text(rx: &Receiver<ServerMsg>, needle: &str, timeout: Duratio
                 }
             }
             Ok(ServerMsg::Exited(code)) => panic!("session exited early with code {code}"),
-            Ok(ServerMsg::InfoReply { .. }) => {}
+            Ok(ServerMsg::InfoReply { .. })
+            | Ok(ServerMsg::CaptureReply(_))
+            | Ok(ServerMsg::Detached) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 panic!(
@@ -269,6 +271,298 @@ fn output_produced_while_detached_is_still_there_on_reattach() {
     assert!(
         screen.contains(&marker),
         "work done while detached must be visible on reattach"
+    );
+}
+
+#[test]
+fn shell_state_persists_across_separate_send_and_capture_calls() {
+    // This is the automation path: no console, no attach. Each send/capture is
+    // an independent connection, exactly as a script or another program would
+    // do it, and the shell's variables have to survive between them.
+    let session = start_session("state");
+
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    wmux::client::send_keys(&session.name, "$demo = 6 * 7\r").expect("assign a variable");
+    // A fresh connection, as if from a completely separate invocation.
+    wmux::client::send_keys(&session.name, "Write-Output \"answer=$demo\"\r")
+        .expect("read the variable back");
+
+    let screen = wmux::client::capture_wait(&session.name, "answer=42", Duration::from_secs(20))
+        .expect("the variable should still be set");
+
+    assert!(
+        screen.contains("answer=42"),
+        "state did not survive between calls; screen was:\n{screen}"
+    );
+}
+
+#[test]
+fn capture_does_not_register_as_an_attached_client() {
+    let session = start_session("captureonly");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    let conn = connect(&session.name);
+    ClientMsg::Info.write_to(&mut &*conn).expect("send info");
+    match ServerMsg::read_from(&mut &*conn).expect("read info reply") {
+        ServerMsg::InfoReply { clients, .. } => assert_eq!(clients, 0),
+        other => panic!("expected an info reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn run_returns_the_pipeline_as_json_not_a_screen_scrape() {
+    use wmux::run::{self, Format};
+
+    let session = start_session("runjson");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    let json = run::run(
+        &session.name,
+        "1..4 | ForEach-Object { $_ * $_ }",
+        Format::Json,
+        4,
+        Duration::from_secs(60),
+    )
+    .expect("run should return");
+
+    assert!(
+        json.contains("\"Output\":[1,4,9,16]"),
+        "expected the real pipeline values, got: {json}"
+    );
+    assert!(json.contains("\"Success\":true"), "got: {json}");
+}
+
+#[test]
+fn run_survives_output_far_wider_than_the_terminal() {
+    use wmux::run::{self, Format};
+
+    // 4000 characters on an 80-column screen. A screen scrape would return
+    // this wrapped across 50 rows, and most of it would have scrolled away.
+    let session = start_session("runwide");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    let text = run::run(
+        &session.name,
+        "-join ('x' * 4000)",
+        Format::Text,
+        4,
+        Duration::from_secs(60),
+    )
+    .expect("run should return");
+
+    let xs = text.chars().filter(|c| *c == 'x').count();
+    assert_eq!(
+        xs, 4000,
+        "payload was truncated or wrapped; got {xs} characters"
+    );
+}
+
+#[test]
+fn run_reports_a_failing_command_without_killing_the_session() {
+    use wmux::run::{self, Format};
+
+    let session = start_session("runerr");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    let json = run::run(
+        &session.name,
+        "throw 'deliberate failure'",
+        Format::Json,
+        4,
+        Duration::from_secs(60),
+    )
+    .expect("run should still return a result");
+
+    assert!(json.contains("\"Success\":false"), "got: {json}");
+    assert!(json.contains("deliberate failure"), "got: {json}");
+
+    // The session must still be usable afterwards.
+    let after = run::run(
+        &session.name,
+        "2 + 2",
+        Format::Json,
+        4,
+        Duration::from_secs(60),
+    )
+    .expect("the session should survive a failing command");
+    assert!(after.contains("\"Output\":[4]"), "got: {after}");
+}
+
+#[test]
+fn ctrl_b_then_d_is_intercepted_by_the_client_not_the_session() {
+    // A session's ConPTY *is* a real console, so wmux can host its own client
+    // and exercise the whole key path: input bytes -> conhost key records ->
+    // ENABLE_VIRTUAL_TERMINAL_INPUT translation -> the client's read.
+    //
+    // This regression exists because the client originally read through
+    // `std::io::stdin()`, which on Windows goes via `ReadConsoleW` — the
+    // legacy console path that does not deliver VT input. The prefix fell
+    // straight through to the session, where PSReadLine treated Ctrl-B as
+    // backward-char, and detaching was impossible.
+    let inner = start_session("kbinner");
+    let outer = start_session("kbouter");
+
+    wmux::client::capture_wait(&inner.name, "PS ", SHELL_TIMEOUT).expect("inner shell");
+    wmux::client::capture_wait(&outer.name, "PS ", SHELL_TIMEOUT).expect("outer shell");
+
+    // Split at the source so the marker only ever appears in *output*, never
+    // in the echoed command.
+    let marker = format!("KBMARK{}", std::process::id());
+    let (head, tail) = marker.split_at(6);
+    wmux::client::send_keys(
+        &inner.name,
+        &format!("Write-Output ('{head}' + '{tail}')\r"),
+    )
+    .expect("mark inner");
+    wmux::client::capture_wait(&inner.name, &marker, Duration::from_secs(30))
+        .expect("inner should show its marker");
+
+    // Attach to inner from inside outer.
+    let exe = wmux_exe();
+    wmux::client::send_keys(
+        &outer.name,
+        &format!("& '{}' attach {}\r", exe.display(), inner.name),
+    )
+    .expect("start attach inside outer");
+
+    // Outer's screen is now inner's screen, which proves the repaint landed.
+    wmux::client::capture_wait(&outer.name, &marker, Duration::from_secs(45))
+        .expect("attaching should repaint inner's screen onto outer");
+
+    // The actual test: Ctrl-B, then d.
+    wmux::client::send_keys(&outer.name, "\u{2}d").expect("send the detach sequence");
+
+    let screen = wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
+        .expect("the prefix must be intercepted by the client, not forwarded to the session");
+    assert!(
+        screen.contains("[detached from"),
+        "expected a detach notice, got:\n{screen}"
+    );
+
+    assert!(
+        session::session_exists(&inner.name).expect("list sessions"),
+        "detaching must leave the session running"
+    );
+}
+
+#[test]
+fn a_lone_prefix_is_swallowed_rather_than_reaching_the_shell() {
+    // If the prefix leaked through, PSReadLine would act on it. Sending the
+    // prefix followed by Enter must leave the command line untouched, so the
+    // shell just sees a bare Enter and redraws its prompt.
+    let inner = start_session("kbsolo");
+    let outer = start_session("kbsoloout");
+
+    wmux::client::capture_wait(&inner.name, "PS ", SHELL_TIMEOUT).expect("inner shell");
+    wmux::client::capture_wait(&outer.name, "PS ", SHELL_TIMEOUT).expect("outer shell");
+
+    // Mark inner so we can tell its screen from outer's. Waiting on "PS "
+    // would match outer's *own* prompt and race ahead of the attach.
+    let marker = format!("SOLOMARK{}", std::process::id());
+    let (head, tail) = marker.split_at(8);
+    wmux::client::send_keys(
+        &inner.name,
+        &format!("Write-Output ('{head}' + '{tail}')\r"),
+    )
+    .expect("mark inner");
+    wmux::client::capture_wait(&inner.name, &marker, Duration::from_secs(30))
+        .expect("inner should show its marker");
+
+    let exe = wmux_exe();
+    wmux::client::send_keys(
+        &outer.name,
+        &format!("& '{}' attach {}\r", exe.display(), inner.name),
+    )
+    .expect("start attach inside outer");
+    wmux::client::capture_wait(&outer.name, &marker, Duration::from_secs(45))
+        .expect("attach should repaint inner's screen onto outer");
+
+    // A lone prefix arms the detector and forwards nothing.
+    wmux::client::send_keys(&outer.name, "\u{2}").expect("send a bare prefix");
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Then 'd' completes the sequence even though it arrived in a later read.
+    wmux::client::send_keys(&outer.name, "d").expect("complete the sequence");
+    wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
+        .expect("a prefix split across reads must still detach");
+}
+
+#[test]
+fn detach_from_outside_works_without_any_keyboard() {
+    // The escape hatch: if the prefix key cannot be delivered at all, a second
+    // terminal can still free the attached client.
+    let inner = start_session("extinner");
+    let outer = start_session("extouter");
+
+    wmux::client::capture_wait(&inner.name, "PS ", SHELL_TIMEOUT).expect("inner shell");
+    wmux::client::capture_wait(&outer.name, "PS ", SHELL_TIMEOUT).expect("outer shell");
+
+    let marker = format!("EXTMARK{}", std::process::id());
+    let (head, tail) = marker.split_at(7);
+    wmux::client::send_keys(
+        &inner.name,
+        &format!("Write-Output ('{head}' + '{tail}')\r"),
+    )
+    .expect("mark inner");
+    wmux::client::capture_wait(&inner.name, &marker, Duration::from_secs(30)).expect("marked");
+
+    let exe = wmux_exe();
+    wmux::client::send_keys(
+        &outer.name,
+        &format!("& '{}' attach {}\r", exe.display(), inner.name),
+    )
+    .expect("attach from outer");
+    wmux::client::capture_wait(&outer.name, &marker, Duration::from_secs(45)).expect("attached");
+
+    // No keystrokes involved at all.
+    wmux::client::detach_clients(&inner.name).expect("detach from outside");
+
+    wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
+        .expect("the attached client should have returned to its shell");
+    assert!(
+        session::session_exists(&inner.name).expect("list sessions"),
+        "an external detach must leave the session running"
+    );
+}
+
+#[test]
+fn bare_wmux_detach_inside_a_session_detaches_it() {
+    // Typing `wmux detach` at a session's own prompt should do what the prefix
+    // key does. The session server exports WMUX_SESSION, so the command can
+    // work out which session it is inside without being told.
+    let inner = start_session("selfinner");
+    let outer = start_session("selfouter");
+
+    wmux::client::capture_wait(&inner.name, "PS ", SHELL_TIMEOUT).expect("inner shell");
+    wmux::client::capture_wait(&outer.name, "PS ", SHELL_TIMEOUT).expect("outer shell");
+
+    let marker = format!("SELFMARK{}", std::process::id());
+    let (head, tail) = marker.split_at(8);
+    wmux::client::send_keys(
+        &inner.name,
+        &format!("Write-Output ('{head}' + '{tail}')\r"),
+    )
+    .expect("mark inner");
+    wmux::client::capture_wait(&inner.name, &marker, Duration::from_secs(30)).expect("marked");
+
+    let exe = wmux_exe();
+    wmux::client::send_keys(
+        &outer.name,
+        &format!("& '{}' attach {}\r", exe.display(), inner.name),
+    )
+    .expect("attach from outer");
+    wmux::client::capture_wait(&outer.name, &marker, Duration::from_secs(45)).expect("attached");
+
+    // Typed *into the session*, with no session name given.
+    wmux::client::send_keys(&inner.name, &format!("& '{}' detach\r", exe.display()))
+        .expect("run bare detach inside the session");
+
+    wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
+        .expect("a bare `wmux detach` inside a session should detach its viewer");
+    assert!(
+        session::session_exists(&inner.name).expect("list sessions"),
+        "the session must keep running"
     );
 }
 
