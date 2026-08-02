@@ -132,6 +132,14 @@ enum Command {
         name: String,
     },
 
+    /// Detach whatever is attached to a session, from another terminal.
+    ///
+    /// Use this when the prefix key is not usable. The session keeps running.
+    Detach {
+        /// Session name.
+        name: String,
+    },
+
     /// Diagnostic: show the raw bytes the console delivers for each keypress.
     ///
     /// Use this when a key binding is not being recognised. It reads the
@@ -188,6 +196,7 @@ fn run() -> Result<()> {
             timeout,
         } => cmd_capture(&name, wait_for.as_deref(), timeout),
         Command::Kill { name } => cmd_kill(&name),
+        Command::Detach { name } => cmd_detach(&name),
         Command::Keys => cmd_keys(),
         Command::Server {
             name,
@@ -331,6 +340,12 @@ fn cmd_capture(name: &str, wait_for: Option<&str>, timeout_secs: u64) -> Result<
 fn cmd_kill(name: &str) -> Result<()> {
     client::kill(name)?;
     println!("[killed {name}]");
+    Ok(())
+}
+
+fn cmd_detach(name: &str) -> Result<()> {
+    client::detach_clients(name)?;
+    println!("[detached {name}]");
     Ok(())
 }
 

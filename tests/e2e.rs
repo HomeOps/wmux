@@ -126,7 +126,9 @@ fn wait_for_screen_text(rx: &Receiver<ServerMsg>, needle: &str, timeout: Duratio
                 }
             }
             Ok(ServerMsg::Exited(code)) => panic!("session exited early with code {code}"),
-            Ok(ServerMsg::InfoReply { .. }) | Ok(ServerMsg::CaptureReply(_)) => {}
+            Ok(ServerMsg::InfoReply { .. })
+            | Ok(ServerMsg::CaptureReply(_))
+            | Ok(ServerMsg::Detached) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 panic!(
@@ -484,6 +486,44 @@ fn a_lone_prefix_is_swallowed_rather_than_reaching_the_shell() {
     wmux::client::send_keys(&outer.name, "d").expect("complete the sequence");
     wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
         .expect("a prefix split across reads must still detach");
+}
+
+#[test]
+fn detach_from_outside_works_without_any_keyboard() {
+    // The escape hatch: if the prefix key cannot be delivered at all, a second
+    // terminal can still free the attached client.
+    let inner = start_session("extinner");
+    let outer = start_session("extouter");
+
+    wmux::client::capture_wait(&inner.name, "PS ", SHELL_TIMEOUT).expect("inner shell");
+    wmux::client::capture_wait(&outer.name, "PS ", SHELL_TIMEOUT).expect("outer shell");
+
+    let marker = format!("EXTMARK{}", std::process::id());
+    let (head, tail) = marker.split_at(7);
+    wmux::client::send_keys(
+        &inner.name,
+        &format!("Write-Output ('{head}' + '{tail}')\r"),
+    )
+    .expect("mark inner");
+    wmux::client::capture_wait(&inner.name, &marker, Duration::from_secs(30)).expect("marked");
+
+    let exe = wmux_exe();
+    wmux::client::send_keys(
+        &outer.name,
+        &format!("& '{}' attach {}\r", exe.display(), inner.name),
+    )
+    .expect("attach from outer");
+    wmux::client::capture_wait(&outer.name, &marker, Duration::from_secs(45)).expect("attached");
+
+    // No keystrokes involved at all.
+    wmux::client::detach_clients(&inner.name).expect("detach from outside");
+
+    wmux::client::capture_wait(&outer.name, "[detached from", Duration::from_secs(45))
+        .expect("the attached client should have returned to its shell");
+    assert!(
+        session::session_exists(&inner.name).expect("list sessions"),
+        "an external detach must leave the session running"
+    );
 }
 
 #[test]

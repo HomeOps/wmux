@@ -27,6 +27,7 @@ mod tag {
     pub const KILL: u8 = 0x05;
     pub const INFO: u8 = 0x06;
     pub const CAPTURE: u8 = 0x07;
+    pub const DETACH_CLIENTS: u8 = 0x08;
 
     // server -> client
     pub const REPAINT: u8 = 0x81;
@@ -34,6 +35,7 @@ mod tag {
     pub const EXITED: u8 = 0x83;
     pub const INFO_REPLY: u8 = 0x84;
     pub const CAPTURE_REPLY: u8 = 0x85;
+    pub const DETACHED: u8 = 0x86;
 }
 
 /// A message sent from an attaching client to the session server.
@@ -56,6 +58,11 @@ pub enum ClientMsg {
     /// This is what makes a session usable from a program that has no console
     /// of its own: send input, then read back what the shell put on screen.
     Capture,
+    /// Detach every attached client, from outside the session.
+    ///
+    /// The escape hatch for when the prefix key is unavailable: bound by the
+    /// terminal emulator, remapped, or missing from the keyboard entirely.
+    DetachClients,
 }
 
 /// A message sent from the session server to an attached client.
@@ -77,6 +84,8 @@ pub enum ServerMsg {
     /// Reply to [`ClientMsg::Capture`]: the visible screen, newline separated,
     /// with escape sequences already resolved.
     CaptureReply(String),
+    /// The server is detaching this client; the session keeps running.
+    Detached,
 }
 
 fn write_frame<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> io::Result<()> {
@@ -138,6 +147,7 @@ impl ClientMsg {
             ClientMsg::Kill => write_frame(w, tag::KILL, &[]),
             ClientMsg::Info => write_frame(w, tag::INFO, &[]),
             ClientMsg::Capture => write_frame(w, tag::CAPTURE, &[]),
+            ClientMsg::DetachClients => write_frame(w, tag::DETACH_CLIENTS, &[]),
         }
     }
 
@@ -157,6 +167,7 @@ impl ClientMsg {
             tag::KILL => Ok(ClientMsg::Kill),
             tag::INFO => Ok(ClientMsg::Info),
             tag::CAPTURE => Ok(ClientMsg::Capture),
+            tag::DETACH_CLIENTS => Ok(ClientMsg::DetachClients),
             other => Err(bad(format!("unknown client frame tag 0x{other:02x}"))),
         }
     }
@@ -180,6 +191,7 @@ impl ServerMsg {
                 write_frame(w, tag::INFO_REPLY, &payload)
             }
             ServerMsg::CaptureReply(text) => write_frame(w, tag::CAPTURE_REPLY, text.as_bytes()),
+            ServerMsg::Detached => write_frame(w, tag::DETACHED, &[]),
         }
     }
 
@@ -213,6 +225,7 @@ impl ServerMsg {
             tag::CAPTURE_REPLY => Ok(ServerMsg::CaptureReply(
                 String::from_utf8_lossy(&payload).into_owned(),
             )),
+            tag::DETACHED => Ok(ServerMsg::Detached),
             other => Err(bad(format!("unknown server frame tag 0x{other:02x}"))),
         }
     }

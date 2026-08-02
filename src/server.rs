@@ -293,6 +293,15 @@ fn serve_client(sess: Arc<Session>, conn: PipeConn) -> Result<()> {
                     let _ = sess.killer.lock().unwrap().kill();
                     return Ok(());
                 }
+                ClientMsg::DetachClients => {
+                    let n = sess.client_count();
+                    log(&format!("detaching {n} client(s) on request"));
+                    sess.broadcast(&ServerMsg::Detached);
+                    // Let the writer threads deliver the notice before the
+                    // client list is torn down.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    sess.clients.lock().unwrap().clear();
+                }
                 ClientMsg::Capture => {
                     let text = sess.capture_text();
                     ServerMsg::CaptureReply(text).write_to(&mut &*conn)?;

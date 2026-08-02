@@ -172,6 +172,8 @@ fn pump_output(conn: &Arc<PipeConn>, detached: &Arc<AtomicBool>) -> Result<Outco
                 stdout.flush()?;
             }
             Ok(ServerMsg::Exited(code)) => return Ok(Outcome::Exited(code)),
+            // Someone ran `wmux detach` from outside.
+            Ok(ServerMsg::Detached) => return Ok(Outcome::Detached),
             // An attached client never asks for these, but ignoring them keeps
             // the stream in sync if a future version starts pushing them.
             Ok(ServerMsg::InfoReply { .. }) | Ok(ServerMsg::CaptureReply(_)) => {}
@@ -325,6 +327,22 @@ pub fn capture_wait(name: &str, needle: &str, timeout: std::time::Duration) -> R
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     anyhow::bail!("{needle:?} did not appear within {timeout:?}; screen was:\n{last}")
+}
+
+/// Detaches every client attached to a session, from outside it.
+///
+/// The escape hatch for when the prefix key cannot be used: swallowed by the
+/// terminal emulator, remapped, or simply not working. Run it from any other
+/// terminal and the attached client returns to its shell.
+pub fn detach_clients(name: &str) -> Result<()> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::DetachClients.write_to(&mut &conn)?;
+    // Round-trip so we return only once the server has acted on it.
+    ClientMsg::Capture.write_to(&mut &conn)?;
+    let _ = ServerMsg::read_from(&mut &conn)?;
+    Ok(())
 }
 
 /// Asks a session to terminate its child process.
