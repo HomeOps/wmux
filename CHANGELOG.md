@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/HomeOps/wmux/compare/v0.3.0...v0.3.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* restore win32-input-mode decoding and default run depth to 2 ([fd11f64](https://github.com/HomeOps/wmux/commit/fd11f6498e1bf09a40b755041c4350fd629f9396))
+
 ## [0.3.0](https://github.com/HomeOps/wmux/compare/v0.2.0...v0.3.0) (2026-08-02)
 
 
