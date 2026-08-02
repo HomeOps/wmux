@@ -99,7 +99,11 @@ enum Command {
         format: run::Format,
 
         /// Serialisation depth for clixml and json.
-        #[arg(long, default_value_t = 8)]
+        ///
+        /// Defaults to 2, matching Export-Clixml. Raising this on rich objects
+        /// such as files or processes can produce gigabytes, because their
+        /// graphs are recursive; prefer Select-Object to pick properties.
+        #[arg(long, default_value_t = run::DEFAULT_DEPTH)]
         depth: u32,
 
         /// Seconds to wait for the command to finish.

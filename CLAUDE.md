@@ -94,6 +94,27 @@ temp file and touches a separate completion marker; wmux polls for the marker
 so it can never read a half-flushed payload. Keep that ordering — the marker is
 written *after* the payload, and there is a test asserting it.
 
+**Console input is not a byte stream — decode it before matching keys.**
+Windows Terminal negotiates **win32-input-mode**, so a keystroke arrives as
+`ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` rather than as a plain byte. Ctrl-B is
+`ESC[66;48;2;1;40;1_`, never a bare `0x02`. Anything scanning the raw stream
+for a control byte finds nothing and forwards the whole sequence to the
+session, where the shell acts on it. Always go through `input::InputParser`,
+which yields `Key { ch, raw }`; match on `ch`, forward `raw` untouched so the
+negotiated encoding still reaches the session.
+
+**Key *releases* arrive between the prefix and the key it modifies.** Ctrl-B
+produces a key-down and a key-up, and releasing Ctrl produces another event,
+all before `d` is pressed. A detector that resolves its binding on the next
+event of any kind gets cancelled by the release and can never detach. Hold
+characterless events while armed and replay them only if the sequence turns
+out not to be a binding.
+
+**A ConPTY does not negotiate win32-input-mode, so nested-session tests cannot
+catch this class of bug.** They still cover byte plumbing, but key encoding
+must be tested against captured real-terminal sequences — see the constants in
+`client::tests`.
+
 **Never read console input with `std::io::stdin()`.** Rust's Windows
 implementation goes through `ReadConsoleW`, the legacy console path, which does
 not deliver `ENABLE_VIRTUAL_TERMINAL_INPUT` bytes. The Ctrl-B prefix fell

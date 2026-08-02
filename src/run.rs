@@ -122,6 +122,18 @@ fn unique_id() -> String {
     format!("{}-{nanos:x}-{seq:x}", std::process::id())
 }
 
+/// Default serialisation depth.
+///
+/// Matches `Export-Clixml` and `ConvertTo-Json`, and for the same reason: rich
+/// .NET objects have recursive graphs. `FileInfo.Directory` leads to
+/// `DirectoryInfo.Parent` and onward, so a plain `dir` serialised at depth 8
+/// produced 688 MB of CLIXML and appeared to hang the session. Raise it
+/// deliberately with `--depth`, never by default.
+pub const DEFAULT_DEPTH: u32 = 2;
+
+/// Age at which an orphaned artifact is considered abandoned and swept.
+const STALE_ARTIFACT_AGE: Duration = Duration::from_secs(60 * 60);
+
 /// Where a run's payload and completion marker live.
 struct Artifacts {
     out: PathBuf,
@@ -159,6 +171,11 @@ pub fn run(
         bail!("the command must be a single line; it is delivered as keystrokes");
     }
 
+    // A run that times out leaves its files to be written later by a session
+    // that is still working, so they cannot be cleaned up at the time. Sweep
+    // abandoned ones on the next run instead.
+    sweep_stale_artifacts();
+
     let artifacts = Artifacts::new();
     let line = wrapper(command, &artifacts.out, &artifacts.done, format, depth);
 
@@ -185,9 +202,40 @@ fn wait_for_result(artifacts: &Artifacts, timeout: Duration) -> Result<String> {
         std::thread::sleep(Duration::from_millis(50));
     }
     bail!(
-        "the session did not finish within {timeout:?}. It may still be busy with \
-         an earlier command, or waiting at a prompt; check with `wmux capture`."
+        "the session did not finish within {timeout:?}.\n\
+         It may still be busy, waiting at a prompt, or serialising a very large \
+         object graph. Check with `wmux capture`, and press Ctrl-C in the session \
+         if it is stuck.\n\
+         If the command returns rich objects such as files or processes, pipe it \
+         through `Select-Object` to pick the properties you need rather than \
+         raising --depth: deep graphs serialise into gigabytes."
     )
+}
+
+/// Removes run artifacts left behind by earlier timed-out runs.
+fn sweep_stale_artifacts() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("wmux-run-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| {
+                t.elapsed()
+                    .map(|age| age > STALE_ARTIFACT_AGE)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// PowerShell may prefix a UTF-8 BOM depending on version and cmdlet.
@@ -284,6 +332,23 @@ mod tests {
             payload_at < marker_at,
             "reading the payload before it is flushed would be a race"
         );
+    }
+
+    #[test]
+    fn the_default_depth_matches_powershell() {
+        // Not a style choice. `dir` serialised at depth 8 produced 688 MB of
+        // CLIXML and looked like a hung session, because FileInfo.Directory
+        // leads to DirectoryInfo.Parent and onward. Export-Clixml defaults to
+        // 2 for the same reason.
+        assert_eq!(DEFAULT_DEPTH, 2);
+    }
+
+    #[test]
+    fn the_wrapper_uses_the_depth_it_is_given() {
+        let json = wrapper("x", Path::new("o"), Path::new("d"), Format::Json, 2);
+        assert!(json.contains("-Depth 2"));
+        let clixml = wrapper("x", Path::new("o"), Path::new("d"), Format::Clixml, 5);
+        assert!(clixml.contains("-Depth 5"));
     }
 
     #[test]
