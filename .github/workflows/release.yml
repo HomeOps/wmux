@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Release PR / tag
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    name: Build release artifact
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = '${{ needs.release-please.outputs.version }}'
+          $zip = "wmux-$version-x64.zip"
+          Compress-Archive -Path 'target/release/wmux.exe', 'README.md', 'LICENSE' -DestinationPath $zip
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Attach to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload '${{ needs.release-please.outputs.tag_name }}' $env:ZIP --clobber
+
+  winget:
+    name: Publish to winget
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Submit manifest update
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            Write-Warning 'WINGET_TOKEN is not set; skipping the winget submission.'
+            exit 0
+          }
+          $version = '${{ needs.release-please.outputs.version }}'
+          $tag = '${{ needs.release-please.outputs.tag_name }}'
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/wmux-$version-x64.zip"
+
+          # wingetcreate is Microsoft's official manifest tool. `update`
+          # requires the package to already exist in microsoft/winget-pkgs;
+          # see CLAUDE.md for the one-time bootstrap with `wingetcreate new`.
+          Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          ./wingetcreate.exe update HomeOps.wmux `
+            --version $version `
+            --urls "$url|x64" `
+            --submit `
+            --token $env:WINGET_TOKEN

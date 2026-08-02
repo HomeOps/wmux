@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Build and test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib --bins
+
+      # These start real detached servers, real ConPTYs, and real pwsh
+      # processes. Limited concurrency keeps shell startup from dominating.
+      - name: End-to-end tests
+        run: cargo test --test e2e -- --test-threads=2
+
+      - name: Release build
+        run: cargo build --release

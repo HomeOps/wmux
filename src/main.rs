@@ -1,0 +1,301 @@
+//! wmux — terminal session persistence for Windows.
+//!
+//! Detach a console session, close the window, reattach later. wmux
+//! deliberately does *not* implement panes, splits, or a status bar: Windows
+//! Terminal already does those well. The one thing Windows lacks is a session
+//! that outlives its window, and that is all this tool provides.
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use wmux::{client, console, protocol, server, session};
+
+/// Creation flags for the detached server process.
+///
+/// `DETACHED_PROCESS` is the whole trick: the server gets no console at all,
+/// so when the terminal window that launched it is closed, the `CTRL_CLOSE_EVENT`
+/// conhost sends to that console never reaches the server.
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+/// Escapes a job object that would otherwise kill the server when the parent
+/// terminal exits. Not every job permits breakaway, so this is best-effort.
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// How long `wmux new` waits for the server to publish its pipe.
+const SERVER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Parser)]
+#[command(
+    name = "wmux",
+    version,
+    about = "Terminal session persistence for Windows",
+    long_about = "Detach a console session, close the window, reattach later.\n\n\
+                  Inside a session, press the tmux prefix Ctrl-B then d to detach.\n\
+                  Press Ctrl-B twice to send a literal Ctrl-B.\n\
+                  Set WMUX_PREFIX (for example ^A) to rebind the prefix."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create a session and attach to it.
+    New {
+        /// Session name. Defaults to the next free wmux-N.
+        #[arg(short = 's', long = "session")]
+        name: Option<String>,
+
+        /// Create the session but do not attach.
+        #[arg(short = 'd', long = "detached")]
+        detached: bool,
+
+        /// Program to run. Defaults to $WMUX_SHELL, else pwsh.exe.
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
+    /// List running sessions.
+    #[command(alias = "list")]
+    Ls,
+
+    /// Attach to an existing session.
+    #[command(alias = "a")]
+    Attach {
+        /// Session name. Defaults to the only running session, if there is one.
+        name: Option<String>,
+    },
+
+    /// Terminate a session and its child process.
+    Kill {
+        /// Session name.
+        name: String,
+    },
+
+    /// Internal: run the session server in this process.
+    #[command(hide = true)]
+    Server {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("wmux: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::New {
+            name,
+            detached,
+            command,
+        } => cmd_new(name, detached, command),
+        Command::Ls => cmd_ls(),
+        Command::Attach { name } => cmd_attach(name),
+        Command::Kill { name } => cmd_kill(&name),
+        Command::Server {
+            name,
+            cols,
+            rows,
+            command,
+        } => server::run(&name, &command, cols, rows),
+    }
+}
+
+fn cmd_new(name: Option<String>, detached: bool, command: Vec<String>) -> Result<()> {
+    let name = match name {
+        Some(n) => {
+            session::validate_name(&n)?;
+            n
+        }
+        None => session::next_free_name()?,
+    };
+
+    if session::session_exists(&name).unwrap_or(false) {
+        bail!("a session named {name:?} is already running; use `wmux attach {name}`");
+    }
+
+    let command = if command.is_empty() {
+        vec![default_shell()]
+    } else {
+        command
+    };
+
+    let size = console::console_size();
+    spawn_detached_server(&name, &command, size.cols, size.rows)?;
+    wait_for_session(&name)?;
+
+    if detached {
+        println!("{name}");
+        return Ok(());
+    }
+    finish_attach(&name, client::attach(&name)?)
+}
+
+fn cmd_ls() -> Result<()> {
+    let names = session::list_sessions()?;
+    if names.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+    for name in names {
+        match client::query_info(&name) {
+            Ok(protocol::ServerMsg::InfoReply {
+                cols,
+                rows,
+                clients,
+                command,
+            }) => {
+                let attached = if clients > 0 { "attached" } else { "detached" };
+                println!("{name}\t{cols}x{rows}\t{attached}\t{command}");
+            }
+            // The session went away between listing and querying, or is busy.
+            _ => println!("{name}\t?"),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_attach(name: Option<String>) -> Result<()> {
+    let name = match name {
+        Some(n) => n,
+        None => {
+            let mut names = session::list_sessions()?;
+            match names.len() {
+                0 => bail!("no sessions are running; start one with `wmux new`"),
+                1 => names.remove(0),
+                n => bail!(
+                    "{n} sessions are running; name one of: {}",
+                    names.join(", ")
+                ),
+            }
+        }
+    };
+    finish_attach(&name, client::attach(&name)?)
+}
+
+fn finish_attach(name: &str, outcome: client::Outcome) -> Result<()> {
+    match outcome {
+        client::Outcome::Detached => {
+            println!("[detached from {name}]");
+            Ok(())
+        }
+        client::Outcome::Exited(code) => {
+            println!("[session {name} exited with code {code}]");
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_kill(name: &str) -> Result<()> {
+    client::kill(name)?;
+    println!("[killed {name}]");
+    Ok(())
+}
+
+/// Launches `wmux server` as a console-less background process.
+fn spawn_detached_server(name: &str, command: &[String], cols: u16, rows: u16) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("could not locate the wmux executable")?;
+
+    let build = |flags: u32| {
+        let mut c = Command::new(&exe);
+        c.arg("server")
+            .arg("--name")
+            .arg(name)
+            .arg("--cols")
+            .arg(cols.to_string())
+            .arg("--rows")
+            .arg(rows.to_string());
+        if !command.is_empty() {
+            // `--` keeps clap from treating the child's own flags as ours.
+            c.arg("--");
+            for part in command {
+                c.arg(part);
+            }
+        }
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(flags);
+        c
+    };
+
+    let preferred = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
+    match build(preferred).spawn() {
+        Ok(_) => Ok(()),
+        // A job object that forbids breakaway rejects the flag outright. Fall
+        // back to a plain detached spawn: the session still survives its
+        // window closing, but if the launching process really was in a
+        // kill-on-close job the session dies with that job. Say so rather than
+        // silently downgrading, because this is exactly the case that matters
+        // when launching over SSH.
+        Err(_) => {
+            build(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+                .context("failed to start the wmux session server")?;
+            eprintln!(
+                "wmux: warning: could not break away from the parent job object; \
+                 this session may not survive its parent process exiting"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Polls until the server publishes its pipe, so `new` never races `attach`.
+fn wait_for_session(name: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + SERVER_START_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if session::session_exists(name).unwrap_or(false) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    bail!(
+        "the session server did not start within {} seconds \
+         (set WMUX_LOG=1 and check %LOCALAPPDATA%\\wmux\\wmux.log)",
+        SERVER_START_TIMEOUT.as_secs()
+    )
+}
+
+/// Picks the shell to run when the user does not name one.
+fn default_shell() -> String {
+    if let Some(shell) = std::env::var_os("WMUX_SHELL") {
+        if let Ok(s) = shell.into_string() {
+            if !s.trim().is_empty() {
+                return s;
+            }
+        }
+    }
+    // Prefer PowerShell 7 when it is installed, fall back to Windows PowerShell.
+    if which("pwsh.exe") {
+        "pwsh.exe".to_string()
+    } else {
+        "powershell.exe".to_string()
+    }
+}
+
+/// Cheap PATH lookup; avoids pulling in a crate for one call.
+fn which(exe: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(exe).is_file())
+}

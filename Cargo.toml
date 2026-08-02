@@ -1,0 +1,51 @@
+[package]
+name = "wmux"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Terminal session persistence for Windows. Detach a console session, close the window, reattach later."
+license = "MIT"
+repository = "https://github.com/HomeOps/wmux"
+homepage = "https://github.com/HomeOps/wmux"
+readme = "README.md"
+keywords = ["terminal", "conpty", "tmux", "windows", "session"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "wmux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wmux"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+portable-pty = "0.8"
+vt100 = "0.15"
+
+[dev-dependencies]
+# The end-to-end tests render the session's output stream to check what a user
+# would actually see, rather than substring-matching raw VT bytes.
+vt100 = "0.15"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_SystemServices",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
