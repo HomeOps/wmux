@@ -24,5 +24,6 @@ pub mod client;
 pub mod console;
 pub mod pipe;
 pub mod protocol;
+pub mod run;
 pub mod server;
 pub mod session;

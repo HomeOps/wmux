@@ -43,6 +43,7 @@ Get-Process wmux -ErrorAction SilentlyContinue | Stop-Process -Force
 | `src/session.rs` | Name validation, pipe paths, discovery, user SID. |
 | `src/server.rs` | ConPTY host, vt100 screen model, client fanout. |
 | `src/client.rs` | Attach loop, detach key state machine, resize polling. |
+| `src/run.rs` | PowerShell command execution with structured results. |
 | `src/console.rs` | Raw-mode guard and console size. |
 | `src/main.rs` | CLI only. Keep logic in the library. |
 
@@ -84,8 +85,20 @@ transpose. The wire protocol carries `(cols, rows)`.
 screen holds both. Waiting on a literal that appears in the text you sent
 returns immediately, before the command has run. Wait on a sentinel the shell
 constructs at runtime — `("DONE"+"MARK"+...)` — so the needle cannot appear in
-the echo. If this keeps biting, the real fix is a `wmux run` that wraps the
-command in generated start/end markers and returns only what is between them.
+the echo. Prefer `run`, which sidesteps the problem entirely.
+
+**Never route a result over the terminal.** The screen is wrapped to the
+terminal width, loses whatever scrolled away, flattens the object pipeline to
+text, and interleaves the echo with the output. `run` writes the payload to a
+temp file and touches a separate completion marker; wmux polls for the marker
+so it can never read a half-flushed payload. Keep that ordering — the marker is
+written *after* the payload, and there is a test asserting it.
+
+**`run` delivers one line of keystrokes.** A newline would submit the command
+early, so the wrapper must stay single-line and `run` rejects a multi-line
+command. Paths interpolated into it go through `ps_single_quote`, which doubles
+`'` — PowerShell single-quoted literals have no other escape, and backslashes
+are *not* escapes.
 
 ## Testing
 

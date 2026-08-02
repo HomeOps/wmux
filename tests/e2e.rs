@@ -309,6 +309,85 @@ fn capture_does_not_register_as_an_attached_client() {
 }
 
 #[test]
+fn run_returns_the_pipeline_as_json_not_a_screen_scrape() {
+    use wmux::run::{self, Format};
+
+    let session = start_session("runjson");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    let json = run::run(
+        &session.name,
+        "1..4 | ForEach-Object { $_ * $_ }",
+        Format::Json,
+        4,
+        Duration::from_secs(60),
+    )
+    .expect("run should return");
+
+    assert!(
+        json.contains("\"Output\":[1,4,9,16]"),
+        "expected the real pipeline values, got: {json}"
+    );
+    assert!(json.contains("\"Success\":true"), "got: {json}");
+}
+
+#[test]
+fn run_survives_output_far_wider_than_the_terminal() {
+    use wmux::run::{self, Format};
+
+    // 4000 characters on an 80-column screen. A screen scrape would return
+    // this wrapped across 50 rows, and most of it would have scrolled away.
+    let session = start_session("runwide");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    let text = run::run(
+        &session.name,
+        "-join ('x' * 4000)",
+        Format::Text,
+        4,
+        Duration::from_secs(60),
+    )
+    .expect("run should return");
+
+    let xs = text.chars().filter(|c| *c == 'x').count();
+    assert_eq!(
+        xs, 4000,
+        "payload was truncated or wrapped; got {xs} characters"
+    );
+}
+
+#[test]
+fn run_reports_a_failing_command_without_killing_the_session() {
+    use wmux::run::{self, Format};
+
+    let session = start_session("runerr");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    let json = run::run(
+        &session.name,
+        "throw 'deliberate failure'",
+        Format::Json,
+        4,
+        Duration::from_secs(60),
+    )
+    .expect("run should still return a result");
+
+    assert!(json.contains("\"Success\":false"), "got: {json}");
+    assert!(json.contains("deliberate failure"), "got: {json}");
+
+    // The session must still be usable afterwards.
+    let after = run::run(
+        &session.name,
+        "2 + 2",
+        Format::Json,
+        4,
+        Duration::from_secs(60),
+    )
+    .expect("the session should survive a failing command");
+    assert!(after.contains("\"Output\":[4]"), "got: {after}");
+}
+
+#[test]
 fn killing_a_session_removes_it() {
     let session = start_session("kill");
     assert!(session::session_exists(&session.name).unwrap());

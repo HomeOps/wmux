@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use wmux::{client, console, protocol, server, session};
+use wmux::{client, console, protocol, run, server, session};
 
 /// Creation flags for the detached server process.
 ///
@@ -84,6 +84,33 @@ enum Command {
         keys: Vec<String>,
     },
 
+    /// Run a command in a PowerShell session and print its serialised result.
+    ///
+    /// Unlike `capture`, the result does not travel over the terminal: the
+    /// session writes it to a temporary file, so it is neither wrapped to the
+    /// terminal width nor limited to what fits on screen.
+    Run {
+        /// Session name.
+        #[arg(short = 't', long = "session")]
+        name: String,
+
+        /// Serialisation format: clixml, json, or text.
+        #[arg(long, default_value = "clixml")]
+        format: run::Format,
+
+        /// Serialisation depth for clixml and json.
+        #[arg(long, default_value_t = 8)]
+        depth: u32,
+
+        /// Seconds to wait for the command to finish.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+
+        /// The PowerShell command to run.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+
     /// Print a session's visible screen as plain text.
     Capture {
         /// Session name.
@@ -141,6 +168,13 @@ fn run() -> Result<()> {
             no_enter,
             keys,
         } => cmd_send(&name, &keys, no_enter),
+        Command::Run {
+            name,
+            format,
+            depth,
+            timeout,
+            command,
+        } => cmd_run(&name, &command, format, depth, timeout),
         Command::Capture {
             name,
             wait_for,
@@ -251,6 +285,28 @@ fn cmd_send(name: &str, keys: &[String], no_enter: bool) -> Result<()> {
         text.push('\r');
     }
     client::send_keys(name, &text)
+}
+
+fn cmd_run(
+    name: &str,
+    command: &[String],
+    format: run::Format,
+    depth: u32,
+    timeout_secs: u64,
+) -> Result<()> {
+    let command = command.join(" ");
+    let output = run::run(
+        name,
+        &command,
+        format,
+        depth,
+        std::time::Duration::from_secs(timeout_secs),
+    )?;
+    print!("{output}");
+    if !output.ends_with('\n') {
+        println!();
+    }
+    Ok(())
 }
 
 fn cmd_capture(name: &str, wait_for: Option<&str>, timeout_secs: u64) -> Result<()> {
