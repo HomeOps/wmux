@@ -187,17 +187,39 @@ is silently ignored by release-please.
 `.github/workflows/release.yml` runs release-please, builds an x64 zip, attaches
 it to the GitHub release, and submits a winget manifest update.
 
-**One-time bootstrap:** `wingetcreate update` only works once the package
-exists in `microsoft/winget-pkgs`. The first submission must be made manually:
+Publishing uses [WinGet Releaser](https://github.com/vedantmgoyal9/winget-releaser),
+the community-standard action that generates most winget-pkgs PRs. It handles
+forking, branching, the manifest edit, and the upstream PR.
+
+**It can only *update* an existing package.** At least one version must already
+be in `microsoft/winget-pkgs`, so the first submission is manual:
 
 ```powershell
-wingetcreate new https://github.com/HomeOps/wmux/releases/download/v0.1.0/wmux-0.1.0-x64.zip
+winget install Microsoft.WingetCreate
+wingetcreate new https://github.com/HomeOps/wmux/releases/download/v0.3.1/wmux-0.3.1-x64.zip
 ```
 
-Identifier is `HomeOps.wmux`. The workflow needs a `WINGET_TOKEN` secret — a
-**classic** PAT with `public_repo`. A fine-grained PAT generally cannot fork
-`microsoft/winget-pkgs`, which the submission requires. The job skips with a
-warning rather than failing when the secret is absent.
+Identifier is `HomeOps.wmux`. wmux ships a **portable zip**, so the manifest is
+`InstallerType: zip` with `NestedInstallerType: portable` and a
+`PortableCommandAlias` of `wmux`.
+
+Two settings that are easy to get wrong:
+
+- **`installers-regex` must be widened.** The action defaults to
+  `.(exe|msi|msix|appx)(bundle){0,1}$`, which never matches a zip, so the job
+  silently finds no installers. wmux sets `'\.zip$'`.
+- **`token` must be a *classic* PAT with `public_repo`.** Fine-grained tokens
+  do not work — see winget-releaser issue #172. Set it as the `WINGET_TOKEN`
+  secret; the job skips with a warning when it is absent so a release never
+  fails just because publishing is not configured.
+
+Set the `WINGET_FORK_USER` repository *variable* if the `winget-pkgs` fork
+lives under an account other than the token owner's.
+
+**Signing is not required by winget**, and unsigned portable packages are
+accepted. It does matter for the install experience: unsigned binaries trigger
+SmartScreen, and machines with Smart App Control enforced will refuse to run
+them outright. Treat signing as a quality improvement, not a prerequisite.
 
 ARM64 is not built yet; the release workflow ships x64 only. Adding it means
 cross-compiling `aarch64-pc-windows-msvc`, which needs the ARM64 MSVC tools on
