@@ -25,6 +25,13 @@ clap = { version = "4", features = ["derive"] }
 portable-pty = "0.8"
 vt100 = "0.15"
 
+[build-dependencies]
+# Embeds a Windows version resource and application manifest. An executable
+# with no CompanyName, ProductName, or FileDescription is a strong heuristic
+# signal to antivirus machine-learning models; wmux was detected as
+# Trojan:Win32/Wacatac.B!ml partly on that basis.
+winresource = "0.1"
+
 [dev-dependencies]
 # The end-to-end tests render the session's output stream to check what a user
 # would actually see, rather than substring-matching raw VT bytes.
@@ -45,7 +52,12 @@ features = [
 ]
 
 [profile.release]
-opt-level = "z"
+# Deliberately not tuned for minimum size. `opt-level = "z"` plus a stripped
+# symbol table produces a small, dense, symbol-free binary, which is exactly
+# what a packed malware sample looks like to a heuristic scanner. Keeping
+# symbols and normal optimisation costs a few hundred kilobytes and makes the
+# binary look like what it is.
+opt-level = 3
 lto = true
 codegen-units = 1
-strip = true
+strip = false
