@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/HomeOps/wmux/compare/v0.3.1...v0.3.2) (2026-08-03)
+
+
+### Bug Fixes
+
+* embed version metadata and stop building a packer-shaped binary ([#7](https://github.com/HomeOps/wmux/issues/7)) ([96fa66e](https://github.com/HomeOps/wmux/commit/96fa66e699f0ecfc72b303e6d043673c44b43633))
+
 ## [0.3.1](https://github.com/HomeOps/wmux/compare/v0.3.0...v0.3.1) (2026-08-02)
 
 
