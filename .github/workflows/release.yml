@@ -36,6 +36,55 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # Signing is optional so a release never fails just because signing is
+      # not configured. Once the four AZURE_SIGNING_* secrets exist, every
+      # release is signed automatically.
+      - name: Check for signing credentials
+        id: signing
+        shell: bash
+        env:
+          TENANT: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+          CLIENT: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          SECRET: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
+          ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+        run: |
+          if [ -n "$TENANT" ] && [ -n "$CLIENT" ] && [ -n "$SECRET" ] && [ -n "$ACCOUNT" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Azure Artifact Signing is not configured; shipping an unsigned build." >&2
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Signs the executable *before* it is zipped, so the signature travels
+      # with the binary that users actually run. Signing the archive instead
+      # would leave the extracted exe unsigned and still untrusted.
+      - name: Sign wmux.exe
+        if: steps.signing.outputs.ready == 'true'
+        uses: Azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
+          # Region-specific; for example https://eus.codesigning.azure.net/
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE_NAME }}
+          files: ${{ github.workspace }}\target\release\wmux.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: wmux terminal session persistence for Windows
+          description-url: https://github.com/HomeOps/wmux
+
+      - name: Verify signature
+        if: steps.signing.outputs.ready == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature target\release\wmux.exe
+          "Status : $($sig.Status)"
+          "Signer : $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status), refusing to publish" }
+
       - name: Package
         shell: pwsh
         run: |

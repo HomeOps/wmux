@@ -219,7 +219,41 @@ lives under an account other than the token owner's.
 **Signing is not required by winget**, and unsigned portable packages are
 accepted. It does matter for the install experience: unsigned binaries trigger
 SmartScreen, and machines with Smart App Control enforced will refuse to run
-them outright. Treat signing as a quality improvement, not a prerequisite.
+them outright.
+
+## Code signing
+
+The release workflow signs `wmux.exe` with **Azure Artifact Signing** (renamed
+from Trusted Signing in January 2026) using `Azure/artifact-signing-action@v2`.
+
+The step is skipped unless all four secrets are present, so a release never
+fails because signing is unconfigured:
+
+| Name | Kind | Example |
+|---|---|---|
+| `AZURE_SIGNING_TENANT_ID` | secret | Entra tenant (directory) ID |
+| `AZURE_SIGNING_CLIENT_ID` | secret | App registration client ID |
+| `AZURE_SIGNING_CLIENT_SECRET` | secret | App registration secret |
+| `AZURE_SIGNING_ACCOUNT_NAME` | secret | Signing account name |
+| `AZURE_SIGNING_ENDPOINT` | variable | `https://eus.codesigning.azure.net/` |
+| `AZURE_SIGNING_PROFILE_NAME` | variable | Certificate profile name |
+
+The endpoint is **region specific** and must match the region the signing
+account was created in, or signing fails with an unhelpful error.
+
+**Sign the exe, not the zip.** The signature has to travel with the binary the
+user actually runs; signing the archive leaves the extracted executable
+unsigned and still untrusted. The workflow signs before `Compress-Archive` and
+then asserts `Get-AuthenticodeSignature` returns `Valid`, failing the release
+rather than publishing something silently unsigned.
+
+**Signing does not clear an existing Defender `!ml` detection.** It builds
+SmartScreen reputation going forward. A live false positive still needs a
+report at https://www.microsoft.com/en-us/wdsi/filesubmission.
+
+Individual developers are eligible for Artifact Signing; the old requirement
+for three years of company trading history was dropped. Identity validation
+needs a government photo ID and a matching selfie.
 
 ARM64 is not built yet; the release workflow ships x64 only. Adding it means
 cross-compiling `aarch64-pc-windows-msvc`, which needs the ARM64 MSVC tools on
