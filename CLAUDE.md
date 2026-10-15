@@ -168,7 +168,22 @@ the behaviour the tool exists for.
 1. `git checkout -b <type>/<slug>`
 2. Commit, then `gh pr create --base main --title "<type>: <description>"`
 3. Squash-merge; GitHub uses the PR title as the commit subject.
-4. Release-please opens a release PR; merging it tags and publishes.
+4. Release-please opens a release PR and enables GitHub auto-merge on it, so
+   it squash-merges itself once CI passes; that merge tags and publishes.
+
+### Release PR auto-merge
+
+The `automerge` job in `release.yml` runs `gh pr merge --auto --squash` on the
+release PR. Three things must all be true or it silently does not happen:
+
+- **`RELEASE_PLEASE_TOKEN` secret** — a PAT (fine-grained: Contents and Pull
+  requests read/write on this repo; or classic `public_repo`). Events made with
+  `GITHUB_TOKEN` never trigger workflows, so without a PAT CI never runs on the
+  release PR and the merge never triggers the tag/publish run. Without the
+  secret the job warns and the PR must be merged by hand.
+- **"Allow auto-merge"** enabled in the repository settings.
+- **Branch protection on `main` requiring the `Build and test` check.** Auto-merge
+  waits only for *required* checks; with none it merges immediately.
 
 PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/):
 
