@@ -175,6 +175,16 @@ monitor and font allow: 200x60 became 200x49 on a 1080p screen.
 `SetConsoleActiveScreenBuffer` at any time, and a handle opened earlier keeps
 pointing at the old one.
 
+**`SW_HIDE` is not enough: put the console on a private desktop.** `SW_HIDE`
+sets only the window's *initial* state. A legacy program can show its own
+console window at any time (ZTreeWin's eXecute does), and once it appears on
+the user's desktop it steals focus and their keystrokes. The server creates a
+desktop `wmux-legacy-<server pid>` in `WinSta0` and starts the console host
+there (`STARTUPINFO.lpDesktop`). Nobody switches to it, so nothing can ever
+show on the user's screen. Console I/O is not tied to desktops, so attach,
+capture and `WriteConsoleInput` work unchanged. Verified by enumerating the
+console window: absent from `Default`, present on the private desktop, before
+and after eXecute.
 **Pace injected keys.** Write one key's down/up pair, then poll
 `GetNumberOfConsoleInputEvents` until the program has drained it (1 s cap).
 Full-screen programs flush the input buffer when a dialog opens, so a burst of

@@ -34,7 +34,9 @@ use crate::snapshot::{Cell, Snapshot};
 use anyhow::{bail, Context, Result};
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{
+        CloseHandle, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    },
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
     System::{
         Console::{
@@ -48,6 +50,7 @@ use windows_sys::Win32::{
             SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
+        StationsAndDesktops::{CloseDesktop, CreateDesktopW, HDESK},
         Threading::{
             CreateProcessW, GetCurrentProcess, GetExitCodeProcess, TerminateProcess,
             WaitForSingleObject, CREATE_NEW_CONSOLE, INFINITE, PROCESS_INFORMATION,
@@ -83,6 +86,9 @@ const READ_CHUNK_CELLS: usize = 8000;
 pub struct Legacy {
     host: HANDLE,
     host_pid: u32,
+    /// The private desktop the console window lives on, or null when it
+    /// could not be created and the console fell back to the user's desktop.
+    desktop: HDESK,
     /// Console calls from several client threads are serialised so that a
     /// key sequence is never interleaved with another client's.
     lock: std::sync::Mutex<()>,
@@ -94,7 +100,12 @@ unsafe impl Sync for Legacy {}
 
 impl Drop for Legacy {
     fn drop(&mut self) {
-        unsafe { CloseHandle(self.host) };
+        unsafe {
+            CloseHandle(self.host);
+            if !self.desktop.is_null() {
+                CloseDesktop(self.desktop);
+            }
+        }
     }
 }
 
@@ -118,10 +129,28 @@ impl Legacy {
         args.extend(command.iter().cloned());
         let mut cmdline: Vec<u16> = command_line(&args).encode_utf16().chain([0]).collect();
 
+        // SW_HIDE only sets the window's *initial* state. A legacy program
+        // can show its own console window at any time (ZTreeWin's eXecute
+        // does), and a window shown on the user's desktop steals focus and
+        // their keystrokes. So the console is created on a private desktop:
+        // its window can never appear on, or take focus from, the desktop
+        // the user is working on, whatever the program does. Console I/O is
+        // not tied to desktops, so attach, capture and key injection are
+        // unaffected.
+        let desktop = create_private_desktop();
+        let mut desktop_path: Vec<u16> = Vec::new();
+
         let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         si.dwFlags = STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
+        if let Some((_, name)) = &desktop {
+            desktop_path = format!("WinSta0\\{name}")
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            si.lpDesktop = desktop_path.as_mut_ptr();
+        }
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
         let ok = unsafe {
@@ -138,15 +167,21 @@ impl Legacy {
                 &mut pi,
             )
         };
+        // The path must outlive CreateProcessW, which reads lpDesktop.
+        drop(desktop_path);
         if ok == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to start the legacy console host");
+            let err = std::io::Error::last_os_error();
+            if let Some((hdesk, _)) = desktop {
+                unsafe { CloseDesktop(hdesk) };
+            }
+            return Err(err).context("failed to start the legacy console host");
         }
         unsafe { CloseHandle(pi.hThread) };
 
         let legacy = Legacy {
             host: pi.hProcess,
             host_pid: pi.dwProcessId,
+            desktop: desktop.map_or(std::ptr::null_mut(), |(h, _)| h),
             lock: std::sync::Mutex::new(()),
         };
         legacy.attach()?;
@@ -313,6 +348,37 @@ impl Legacy {
         }
         Ok(())
     }
+}
+
+/// Creates a desktop in the interactive window station for the console to
+/// live on. Nobody ever switches to it, so its windows are never seen.
+///
+/// Returns `None` (and logs) if the desktop cannot be created, in which case
+/// the console falls back to the user's desktop with only SW_HIDE protecting
+/// it: better a session that works than none at all.
+fn create_private_desktop() -> Option<(HDESK, String)> {
+    let name = format!("wmux-legacy-{}", std::process::id());
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let hdesk = unsafe {
+        CreateDesktopW(
+            wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            GENERIC_ALL,
+            std::ptr::null(),
+        )
+    };
+    if hdesk.is_null() {
+        crate::server::log(&format!(
+            "could not create private desktop {name}: {}; the console window \
+             will live on the user's desktop",
+            std::io::Error::last_os_error()
+        ));
+        return None;
+    }
+    crate::server::log(&format!("legacy console on private desktop {name}"));
+    Some((hdesk, name))
 }
 
 /// A console handle opened by name, closed on drop.
