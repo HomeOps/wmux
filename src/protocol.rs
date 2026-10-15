@@ -12,6 +12,8 @@
 //! The framing is hand-rolled on purpose: it keeps the dependency surface
 //! small and makes the byte layout obvious when debugging with a pipe sniffer.
 
+use crate::keys::Key;
+use crate::snapshot::Snapshot;
 use std::io::{self, Read, Write};
 
 /// Largest payload we will accept in a single frame. Guards against a
@@ -28,6 +30,8 @@ mod tag {
     pub const INFO: u8 = 0x06;
     pub const CAPTURE: u8 = 0x07;
     pub const DETACH_CLIENTS: u8 = 0x08;
+    pub const KEYS: u8 = 0x09;
+    pub const SNAPSHOT: u8 = 0x0a;
 
     // server -> client
     pub const REPAINT: u8 = 0x81;
@@ -36,6 +40,8 @@ mod tag {
     pub const INFO_REPLY: u8 = 0x84;
     pub const CAPTURE_REPLY: u8 = 0x85;
     pub const DETACHED: u8 = 0x86;
+    pub const SNAPSHOT_REPLY: u8 = 0x87;
+    pub const ERROR: u8 = 0x88;
 }
 
 /// A message sent from an attaching client to the session server.
@@ -63,6 +69,13 @@ pub enum ClientMsg {
     /// The escape hatch for when the prefix key is unavailable: bound by the
     /// terminal emulator, remapped, or missing from the keyboard entirely.
     DetachClients,
+    /// Named keypresses, delivered in whatever form the session's backend
+    /// understands: VT sequences for a ConPTY, key records for a legacy
+    /// console. See [`crate::keys`].
+    Keys(Vec<Key>),
+    /// Request the screen with attributes, plus up to `scrollback` rows of
+    /// history above it.
+    Snapshot { scrollback: u32 },
 }
 
 /// A message sent from the session server to an attached client.
@@ -86,6 +99,10 @@ pub enum ServerMsg {
     CaptureReply(String),
     /// The server is detaching this client; the session keeps running.
     Detached,
+    /// Reply to [`ClientMsg::Snapshot`].
+    Snapshot(Snapshot),
+    /// The request could not be carried out. Sent instead of the normal reply.
+    Error(String),
 }
 
 fn write_frame<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> io::Result<()> {
@@ -148,6 +165,16 @@ impl ClientMsg {
             ClientMsg::Info => write_frame(w, tag::INFO, &[]),
             ClientMsg::Capture => write_frame(w, tag::CAPTURE, &[]),
             ClientMsg::DetachClients => write_frame(w, tag::DETACH_CLIENTS, &[]),
+            ClientMsg::Keys(keys) => {
+                let mut payload = Vec::with_capacity(keys.len() * Key::WIRE_LEN);
+                for key in keys {
+                    key.encode(&mut payload);
+                }
+                write_frame(w, tag::KEYS, &payload)
+            }
+            ClientMsg::Snapshot { scrollback } => {
+                write_frame(w, tag::SNAPSHOT, &scrollback.to_le_bytes())
+            }
         }
     }
 
@@ -168,6 +195,26 @@ impl ClientMsg {
             tag::INFO => Ok(ClientMsg::Info),
             tag::CAPTURE => Ok(ClientMsg::Capture),
             tag::DETACH_CLIENTS => Ok(ClientMsg::DetachClients),
+            tag::KEYS => {
+                if payload.len() % Key::WIRE_LEN != 0 {
+                    return Err(bad("keys payload is not a whole number of keys"));
+                }
+                payload
+                    .chunks_exact(Key::WIRE_LEN)
+                    .map(|c| Key::decode(c).ok_or_else(|| bad("malformed key")))
+                    .collect::<io::Result<Vec<_>>>()
+                    .map(ClientMsg::Keys)
+            }
+            tag::SNAPSHOT => {
+                if payload.len() < 4 {
+                    return Err(bad("expected 4 bytes of scrollback"));
+                }
+                Ok(ClientMsg::Snapshot {
+                    scrollback: u32::from_le_bytes([
+                        payload[0], payload[1], payload[2], payload[3],
+                    ]),
+                })
+            }
             other => Err(bad(format!("unknown client frame tag 0x{other:02x}"))),
         }
     }
@@ -192,6 +239,8 @@ impl ServerMsg {
             }
             ServerMsg::CaptureReply(text) => write_frame(w, tag::CAPTURE_REPLY, text.as_bytes()),
             ServerMsg::Detached => write_frame(w, tag::DETACHED, &[]),
+            ServerMsg::Snapshot(snap) => write_frame(w, tag::SNAPSHOT_REPLY, &snap.encode()),
+            ServerMsg::Error(msg) => write_frame(w, tag::ERROR, msg.as_bytes()),
         }
     }
 
@@ -226,6 +275,12 @@ impl ServerMsg {
                 String::from_utf8_lossy(&payload).into_owned(),
             )),
             tag::DETACHED => Ok(ServerMsg::Detached),
+            tag::SNAPSHOT_REPLY => Snapshot::decode(&payload)
+                .map(ServerMsg::Snapshot)
+                .ok_or_else(|| bad("malformed snapshot")),
+            tag::ERROR => Ok(ServerMsg::Error(
+                String::from_utf8_lossy(&payload).into_owned(),
+            )),
             other => Err(bad(format!("unknown server frame tag 0x{other:02x}"))),
         }
     }
@@ -262,6 +317,12 @@ mod tests {
         roundtrip_client(ClientMsg::Kill);
         roundtrip_client(ClientMsg::Info);
         roundtrip_client(ClientMsg::Capture);
+        roundtrip_client(ClientMsg::Keys(vec![
+            Key::parse("F1").unwrap(),
+            Key::parse("Alt-F10").unwrap(),
+            Key::char('q'),
+        ]));
+        roundtrip_client(ClientMsg::Snapshot { scrollback: 500 });
     }
 
     #[test]
@@ -276,6 +337,16 @@ mod tests {
             command: "pwsh.exe".into(),
         });
         roundtrip_server(ServerMsg::CaptureReply("PS X:\\> echo hi\nhi\n".into()));
+        roundtrip_server(ServerMsg::Snapshot(Snapshot::blank(4, 2)));
+        roundtrip_server(ServerMsg::Error("not supported".into()));
+    }
+
+    #[test]
+    fn a_keys_payload_with_a_partial_key_is_rejected() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, tag::KEYS, &[1, 101, 0, 0, 0]).unwrap();
+        let err = ClientMsg::read_from(&mut Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

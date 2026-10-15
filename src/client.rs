@@ -205,7 +205,11 @@ fn pump_output(conn: &Arc<PipeConn>, detached: &Arc<AtomicBool>) -> Result<Outco
             Ok(ServerMsg::Detached) => return Ok(Outcome::Detached),
             // An attached client never asks for these, but ignoring them keeps
             // the stream in sync if a future version starts pushing them.
-            Ok(ServerMsg::InfoReply { .. }) | Ok(ServerMsg::CaptureReply(_)) => {}
+            Ok(ServerMsg::InfoReply { .. })
+            | Ok(ServerMsg::CaptureReply(_))
+            | Ok(ServerMsg::Snapshot(_)) => {}
+            // The session refused the attach, e.g. a legacy console session.
+            Ok(ServerMsg::Error(msg)) => anyhow::bail!("{msg}"),
             Err(_) => {
                 // The connection dropped. If we asked to detach, that is the
                 // server acknowledging by closing; otherwise the session died
@@ -325,6 +329,51 @@ pub fn send_keys(name: &str, keys: &str) -> Result<()> {
     match ServerMsg::read_from(&mut &conn)? {
         ServerMsg::CaptureReply(_) => Ok(()),
         other => anyhow::bail!("unexpected reply to send: {other:?}"),
+    }
+}
+
+/// Sends named keypresses. Like [`send_keys`], returns only once the server
+/// has delivered them; for a legacy session that means the program has read
+/// each one, or a per-key timeout passed.
+pub fn send_key_events(name: &str, keys: &[crate::keys::Key]) -> Result<()> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::Keys(keys.to_vec()).write_to(&mut &conn)?;
+    ClientMsg::Capture.write_to(&mut &conn)?;
+    match ServerMsg::read_from(&mut &conn)? {
+        ServerMsg::CaptureReply(_) => Ok(()),
+        other => anyhow::bail!("unexpected reply to key: {other:?}"),
+    }
+}
+
+/// Reads the screen with attributes, plus up to `scrollback` rows of history.
+pub fn snapshot(name: &str, scrollback: u32) -> Result<crate::snapshot::Snapshot> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::Snapshot { scrollback }.write_to(&mut &conn)?;
+    match ServerMsg::read_from(&mut &conn)? {
+        ServerMsg::Snapshot(snap) => Ok(snap),
+        ServerMsg::Error(msg) => anyhow::bail!("{msg}"),
+        other => anyhow::bail!("unexpected reply to snapshot: {other:?}"),
+    }
+}
+
+/// Resizes a session without attaching and returns the size it ended up as.
+///
+/// The result can differ from the request: a legacy console cannot exceed
+/// the largest window the screen and font allow, and an attached client
+/// resizes the session to its own terminal.
+pub fn resize(name: &str, cols: u16, rows: u16) -> Result<(u16, u16)> {
+    let path = session::pipe_path(name)?;
+    let conn = PipeConn::connect(&path)
+        .with_context(|| format!("no session named {name:?} is running"))?;
+    ClientMsg::Resize { cols, rows }.write_to(&mut &conn)?;
+    ClientMsg::Info.write_to(&mut &conn)?;
+    match ServerMsg::read_from(&mut &conn)? {
+        ServerMsg::InfoReply { cols, rows, .. } => Ok((cols, rows)),
+        other => anyhow::bail!("unexpected reply to resize: {other:?}"),
     }
 }
 

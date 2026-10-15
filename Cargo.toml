@@ -49,6 +49,10 @@ features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_System_SystemServices",
+    # Legacy console sessions: a kill-on-close job for the program tree, and
+    # virtual-key lookup for injected keypresses.
+    "Win32_System_JobObjects",
+    "Win32_UI_Input_KeyboardAndMouse",
 ]
 
 [profile.release]

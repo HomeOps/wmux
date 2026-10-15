@@ -48,25 +48,25 @@ impl Drop for TestSession {
 
 // The child is handed to `TestSession`, whose Drop kills and reaps it on every
 // exit path. Clippy cannot see across the move.
-#[allow(clippy::zombie_processes)]
 fn start_session(tag: &str) -> TestSession {
+    start_session_with(tag, &[], &["pwsh.exe", "-NoLogo", "-NoProfile"])
+}
+
+#[allow(clippy::zombie_processes)]
+fn start_session_with(tag: &str, server_args: &[&str], command: &[&str]) -> TestSession {
     // Unique per process so concurrent test binaries never collide.
     let name = format!("wmuxtest-{}-{}", tag, std::process::id());
 
     let child = Command::new(wmux_exe())
-        .args([
-            "server",
-            "--name",
-            &name,
-            "--cols",
-            &COLS.to_string(),
-            "--rows",
-            &ROWS.to_string(),
-            "--",
-            "pwsh.exe",
-            "-NoLogo",
-            "-NoProfile",
-        ])
+        .args(["server", "--name", &name])
+        .args(["--cols", &COLS.to_string(), "--rows", &ROWS.to_string()])
+        .args(server_args)
+        .arg("--")
+        .args(command)
+        // pwsh honours NO_COLOR by printing no colour at all, and some
+        // environments (Claude Code among them) set it. The colour tests must
+        // not depend on who runs them.
+        .env_remove("NO_COLOR")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -128,7 +128,9 @@ fn wait_for_screen_text(rx: &Receiver<ServerMsg>, needle: &str, timeout: Duratio
             Ok(ServerMsg::Exited(code)) => panic!("session exited early with code {code}"),
             Ok(ServerMsg::InfoReply { .. })
             | Ok(ServerMsg::CaptureReply(_))
+            | Ok(ServerMsg::Snapshot(_))
             | Ok(ServerMsg::Detached) => {}
+            Ok(ServerMsg::Error(msg)) => panic!("server refused: {msg}"),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 panic!(
@@ -583,4 +585,199 @@ fn killing_a_session_removes_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("session {:?} was still listed after kill", session.name);
+}
+
+// --- named keys, snapshots, resize ----------------------------------------
+
+fn keys(specs: &[&str]) -> Vec<wmux::keys::Key> {
+    specs
+        .iter()
+        .map(|s| wmux::keys::Key::parse(s).unwrap())
+        .collect()
+}
+
+#[test]
+fn named_keys_reach_a_conpty_session_as_vt() {
+    let session = start_session("ptykeys");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    // Type a command, then take it apart with editing keys: Home and Delete
+    // only work if they arrive as the escape sequences PSReadLine expects.
+    wmux::client::send_keys(&session.name, "XWrite-Output ('KEY'+'OK')").unwrap();
+    wmux::client::send_key_events(&session.name, &keys(&["Home", "Delete", "End", "Enter"]))
+        .unwrap();
+    let screen = wmux::client::capture_wait(&session.name, "KEYOK", SHELL_TIMEOUT)
+        .expect("the edited command should run");
+    assert!(
+        !screen.contains("XWrite"),
+        "Home/Delete should have removed the X; screen was:\n{screen}"
+    );
+}
+
+#[test]
+fn a_conpty_snapshot_carries_colours_and_scrollback() {
+    let session = start_session("ptysnap");
+    wmux::client::capture_wait(&session.name, "PS ", SHELL_TIMEOUT).expect("shell should start");
+
+    // Enough lines to push the first ones into scrollback, then one coloured.
+    wmux::client::send_keys(
+        &session.name,
+        "1..40 | % { \"line$_\" }; Write-Host ('CO'+'LOUR') -ForegroundColor Yellow -BackgroundColor DarkBlue\r",
+    )
+    .unwrap();
+    wmux::client::capture_wait(&session.name, "COLOUR", SHELL_TIMEOUT).unwrap();
+
+    let snap = wmux::client::snapshot(&session.name, 1000).unwrap();
+    let lines = snap.lines();
+    assert!(snap.history > 0, "there should be history above the screen");
+    assert!(
+        lines.iter().any(|l| l == "line1"),
+        "line1 scrolled off and should be in the history:\n{}",
+        lines.join("\n")
+    );
+
+    let y = lines
+        .iter()
+        .position(|l| l == "COLOUR")
+        .expect("COLOUR row");
+    assert_eq!(
+        snap.row(y as u16)[0].attr,
+        0x1E,
+        "yellow on dark blue is console attribute 1E"
+    );
+}
+
+#[test]
+fn resizing_without_attaching_changes_the_reported_size() {
+    let session = start_session("resize");
+    let (cols, rows) = wmux::client::resize(&session.name, 132, 43).unwrap();
+    assert_eq!((cols, rows), (132, 43));
+}
+
+// --- legacy console sessions ----------------------------------------------
+
+fn start_legacy(tag: &str, command: &[&str]) -> TestSession {
+    start_session_with(tag, &["--legacy"], command)
+}
+
+#[test]
+fn a_legacy_session_runs_in_a_real_console_and_can_be_typed_into() {
+    let session = start_legacy("legacytype", &["cmd.exe", "/k", "prompt", "LEGACY$G"]);
+    wmux::client::capture_wait(&session.name, "LEGACY>", SHELL_TIMEOUT).expect("cmd should start");
+
+    // Plain text arrives as one key record per character; every character
+    // has to make it, not just the first.
+    wmux::client::send_keys(&session.name, "echo TYPED%PROMPT:~0,3%\r").unwrap();
+    let screen = wmux::client::capture_wait(&session.name, "TYPEDLEG", SHELL_TIMEOUT)
+        .expect("the echoed text should appear");
+    assert!(screen.contains("echo TYPED"), "{screen}");
+
+    // The console reports the size it was created with.
+    let conn = connect(&session.name);
+    ClientMsg::Info.write_to(&mut &*conn).unwrap();
+    match ServerMsg::read_from(&mut &*conn).unwrap() {
+        ServerMsg::InfoReply {
+            cols,
+            rows,
+            command,
+            ..
+        } => {
+            assert_eq!((cols, rows), (COLS, ROWS));
+            assert!(command.starts_with("[legacy]"), "{command}");
+        }
+        other => panic!("expected an info reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_legacy_snapshot_reads_attributes_straight_from_the_console() {
+    let session = start_legacy("legacysnap", &["cmd.exe", "/k", "prompt", "LEGACY$G"]);
+    wmux::client::capture_wait(&session.name, "LEGACY>", SHELL_TIMEOUT).expect("cmd should start");
+
+    // `color 1E` repaints the whole console yellow on blue.
+    wmux::client::send_keys(&session.name, "color 1E\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snap = wmux::client::snapshot(&session.name, 0).unwrap();
+        assert_eq!((snap.cols, snap.rows), (COLS, ROWS));
+        if snap.cells.iter().all(|c| c.attr == 0x1E) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "console never turned 1E");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn named_keys_reach_a_legacy_console_as_key_records() {
+    let session = start_legacy("legacykeys", &["cmd.exe", "/k", "prompt", "LEGACY$G"]);
+    wmux::client::capture_wait(&session.name, "LEGACY>", SHELL_TIMEOUT).expect("cmd should start");
+
+    // cmd's line editor: Esc clears the line, Left/Ins/Home move and edit.
+    wmux::client::send_keys(&session.name, "garbage").unwrap();
+    wmux::client::send_key_events(&session.name, &keys(&["Esc"])).unwrap();
+    wmux::client::send_keys(&session.name, "echo KEYS-WORK").unwrap();
+    wmux::client::send_key_events(&session.name, &keys(&["Home", "Right", "Right"])).unwrap();
+    wmux::client::send_keys(&session.name, "\r").unwrap();
+    let screen = wmux::client::capture_wait(&session.name, "\nKEYS-WORK", SHELL_TIMEOUT)
+        .expect("the command should run after Esc cleared the garbage");
+    assert!(!screen.contains("garbageecho"), "{screen}");
+}
+
+#[test]
+fn a_legacy_session_can_be_resized_and_refuses_impossible_sizes() {
+    let session = start_legacy("legacyresize", &["cmd.exe", "/k"]);
+    wmux::client::capture_wait(&session.name, ">", SHELL_TIMEOUT).expect("cmd should start");
+
+    assert_eq!(
+        wmux::client::resize(&session.name, 100, 30).unwrap(),
+        (100, 30)
+    );
+    // No screen is this large; the console keeps its previous size.
+    assert_eq!(
+        wmux::client::resize(&session.name, 5000, 3000).unwrap(),
+        (100, 30)
+    );
+}
+
+#[test]
+fn attaching_to_a_legacy_session_is_refused_with_an_explanation() {
+    let session = start_legacy("legacyattach", &["cmd.exe", "/k"]);
+    let conn = connect(&session.name);
+    ClientMsg::Attach {
+        cols: COLS,
+        rows: ROWS,
+    }
+    .write_to(&mut &*conn)
+    .unwrap();
+    match ServerMsg::read_from(&mut &*conn).unwrap() {
+        ServerMsg::Error(msg) => assert!(msg.contains("--legacy"), "{msg}"),
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+#[test]
+fn killing_a_legacy_session_takes_the_program_with_it() {
+    let marker = format!("wmuxkill{}", std::process::id());
+    let session = start_legacy("legacykill", &["cmd.exe", "/k", "title", &marker]);
+    wmux::client::capture_wait(&session.name, ">", SHELL_TIMEOUT).expect("cmd should start");
+
+    let conn = connect(&session.name);
+    ClientMsg::Kill.write_to(&mut &*conn).unwrap();
+    drop(conn);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session::session_exists(&session.name).unwrap_or(true) {
+        assert!(Instant::now() < deadline, "session still listed after kill");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The kill-on-close job must have taken cmd.exe down too.
+    let out = Command::new("tasklist")
+        .args(["/v", "/fi", "imagename eq cmd.exe", "/fo", "csv"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(&marker),
+        "cmd.exe outlived its session"
+    );
 }

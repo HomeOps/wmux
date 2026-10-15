@@ -23,8 +23,11 @@
 pub mod client;
 pub mod console;
 pub mod input;
+pub mod keys;
+pub mod legacy;
 pub mod pipe;
 pub mod protocol;
 pub mod run;
 pub mod server;
 pub mod session;
+pub mod snapshot;

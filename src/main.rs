@@ -20,6 +20,14 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// terminal exits. Not every job permits breakaway, so this is best-effort.
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
+/// Default screen for `wmux new -d`. A legacy console that cannot be this
+/// large (the limit depends on the monitor and console font) is clamped to
+/// the largest size Windows allows.
+const DETACHED_SIZE: console::Size = console::Size {
+    cols: 200,
+    rows: 60,
+};
+
 /// How long `wmux new` waits for the server to publish its pipe.
 const SERVER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -49,6 +57,28 @@ enum Command {
         /// Create the session but do not attach.
         #[arg(short = 'd', long = "detached")]
         detached: bool,
+
+        /// Width in columns. Defaults to the current terminal, or 200 with -d.
+        #[arg(short = 'x', long = "cols")]
+        cols: Option<u16>,
+
+        /// Height in rows. Defaults to the current terminal, or 60 with -d.
+        #[arg(short = 'y', long = "rows")]
+        rows: Option<u16>,
+
+        /// Host the program in a real, hidden console instead of a ConPTY.
+        ///
+        /// For programs written against the classic console API that fail or
+        /// draw nothing under a pseudoconsole, typically because they need a
+        /// real console window. Drive them with `key`, `send` and `capture`;
+        /// interactive attach is not supported yet.
+        #[arg(long)]
+        legacy: bool,
+
+        /// Rows of scrollback above the window in a --legacy console.
+        /// ConPTY sessions always keep 10000 lines.
+        #[arg(long, default_value_t = 0, requires = "legacy")]
+        history: u16,
 
         /// Program to run. Defaults to $WMUX_SHELL, else pwsh.exe.
         #[arg(trailing_var_arg = true)]
@@ -82,6 +112,35 @@ enum Command {
         /// Text to type into the session.
         #[arg(trailing_var_arg = true, required = true)]
         keys: Vec<String>,
+    },
+
+    /// Press named keys in a session: F1, Alt-F10, C-x, Down, PgUp, Enter, ...
+    ///
+    /// Modifiers are Ctrl-/C-, Alt-/M- and Shift-/S-. A single character is
+    /// pressed literally. Returns once the session has consumed the keys.
+    Key {
+        /// Session name.
+        #[arg(short = 't', long = "session")]
+        name: String,
+
+        /// Keys to press, in order.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        keys: Vec<String>,
+    },
+
+    /// Resize a session without attaching.
+    Resize {
+        /// Session name.
+        #[arg(short = 't', long = "session")]
+        name: String,
+
+        /// Width in columns.
+        #[arg(short = 'x', long = "cols")]
+        cols: u16,
+
+        /// Height in rows.
+        #[arg(short = 'y', long = "rows")]
+        rows: u16,
     },
 
     /// Run a command in a PowerShell session and print its serialised result.
@@ -128,6 +187,16 @@ enum Command {
         /// Seconds to wait when --wait-for is given.
         #[arg(long, default_value_t = 15)]
         timeout: u64,
+
+        /// Output format. `json` adds a console attribute per cell (two hex
+        /// digits, background then foreground, e.g. 1E is yellow on blue)
+        /// and the cursor position.
+        #[arg(long, default_value = "text")]
+        format: CaptureFormat,
+
+        /// Include up to this many rows of scrollback above the screen.
+        #[arg(short = 'S', long, default_value_t = 0)]
+        scrollback: u32,
     },
 
     /// Terminate a session and its child process.
@@ -163,9 +232,32 @@ enum Command {
         cols: u16,
         #[arg(long, default_value_t = 24)]
         rows: u16,
+        #[arg(long)]
+        legacy: bool,
+        #[arg(long, default_value_t = 0)]
+        history: u16,
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
+
+    /// Internal: the trampoline inside a legacy session's hidden console.
+    #[command(hide = true)]
+    ConsoleHost {
+        #[arg(long)]
+        cols: u16,
+        #[arg(long)]
+        rows: u16,
+        #[arg(long, default_value_t = 0)]
+        history: u16,
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CaptureFormat {
+    Text,
+    Json,
 }
 
 fn main() {
@@ -181,8 +273,21 @@ fn run() -> Result<()> {
         Command::New {
             name,
             detached,
+            cols,
+            rows,
+            legacy,
+            history,
             command,
-        } => cmd_new(name, detached, command),
+        } => {
+            let mode = if legacy {
+                server::Mode::Legacy { history }
+            } else {
+                server::Mode::Pty
+            };
+            cmd_new(name, detached, cols, rows, mode, command)
+        }
+        Command::Key { name, keys } => cmd_key(&name, &keys),
+        Command::Resize { name, cols, rows } => cmd_resize(&name, cols, rows),
         Command::Ls => cmd_ls(),
         Command::Attach { name } => cmd_attach(name),
         Command::Send {
@@ -201,7 +306,9 @@ fn run() -> Result<()> {
             name,
             wait_for,
             timeout,
-        } => cmd_capture(&name, wait_for.as_deref(), timeout),
+            format,
+            scrollback,
+        } => cmd_capture(&name, wait_for.as_deref(), timeout, format, scrollback),
         Command::Kill { name } => cmd_kill(&name),
         Command::Detach { name } => cmd_detach(name),
         Command::Keys => cmd_keys(),
@@ -209,12 +316,37 @@ fn run() -> Result<()> {
             name,
             cols,
             rows,
+            legacy,
+            history,
             command,
-        } => server::run(&name, &command, cols, rows),
+        } => {
+            let mode = if legacy {
+                server::Mode::Legacy { history }
+            } else {
+                server::Mode::Pty
+            };
+            server::run(&name, &command, cols, rows, mode)
+        }
+        Command::ConsoleHost {
+            cols,
+            rows,
+            history,
+            command,
+        } => {
+            let code = wmux::legacy::host_main(cols, rows, history, &command)?;
+            std::process::exit(code)
+        }
     }
 }
 
-fn cmd_new(name: Option<String>, detached: bool, command: Vec<String>) -> Result<()> {
+fn cmd_new(
+    name: Option<String>,
+    detached: bool,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    mode: server::Mode,
+    command: Vec<String>,
+) -> Result<()> {
     let name = match name {
         Some(n) => {
             session::validate_name(&n)?;
@@ -233,8 +365,19 @@ fn cmd_new(name: Option<String>, detached: bool, command: Vec<String>) -> Result
         command
     };
 
-    let size = console::console_size();
-    spawn_detached_server(&name, &command, size.cols, size.rows)?;
+    // An attached session takes the size of the terminal it opens in. A
+    // detached one has no terminal worth copying (often there is none at all,
+    // and the console fallback is a cramped 80x24), so it gets a large screen
+    // that full-screen programs and `capture` can make use of. Attaching later
+    // resizes it to the attaching terminal either way.
+    let size = if detached {
+        DETACHED_SIZE
+    } else {
+        console::console_size()
+    };
+    let cols = cols.unwrap_or(size.cols).max(1);
+    let rows = rows.unwrap_or(size.rows).max(1);
+    spawn_detached_server(&name, &command, cols, rows, mode)?;
     wait_for_session(&name)?;
 
     if detached {
@@ -333,14 +476,53 @@ fn cmd_run(
     Ok(())
 }
 
-fn cmd_capture(name: &str, wait_for: Option<&str>, timeout_secs: u64) -> Result<()> {
-    let screen = match wait_for {
-        Some(needle) => {
-            client::capture_wait(name, needle, std::time::Duration::from_secs(timeout_secs))?
-        }
-        None => client::capture(name)?,
+fn cmd_key(name: &str, specs: &[String]) -> Result<()> {
+    let keys = specs
+        .iter()
+        .map(|s| wmux::keys::Key::parse(s).map_err(anyhow::Error::msg))
+        .collect::<Result<Vec<_>>>()?;
+    client::send_key_events(name, &keys)
+}
+
+fn cmd_resize(name: &str, cols: u16, rows: u16) -> Result<()> {
+    let (got_cols, got_rows) = client::resize(name, cols, rows)?;
+    if (got_cols, got_rows) != (cols, rows) {
+        bail!(
+            "session {name:?} is {got_cols}x{got_rows}, not the requested {cols}x{rows} \
+             (a legacy console is capped by the screen and font size, and an attached \
+             client resizes the session to its own terminal)"
+        );
+    }
+    println!("{name}\t{got_cols}x{got_rows}");
+    Ok(())
+}
+
+fn cmd_capture(
+    name: &str,
+    wait_for: Option<&str>,
+    timeout_secs: u64,
+    format: CaptureFormat,
+    scrollback: u32,
+) -> Result<()> {
+    let text = match wait_for {
+        Some(needle) => Some(client::capture_wait(
+            name,
+            needle,
+            std::time::Duration::from_secs(timeout_secs),
+        )?),
+        None => None,
     };
-    println!("{screen}");
+    match format {
+        CaptureFormat::Text if scrollback == 0 => {
+            let screen = match text {
+                Some(t) => t,
+                None => client::capture(name)?,
+            };
+            println!("{screen}");
+        }
+        CaptureFormat::Text => println!("{}", client::snapshot(name, scrollback)?.to_text()),
+        CaptureFormat::Json => println!("{}", client::snapshot(name, scrollback)?.to_json()),
+    }
     Ok(())
 }
 
@@ -410,7 +592,13 @@ fn cmd_keys() -> Result<()> {
 }
 
 /// Launches `wmux server` as a console-less background process.
-fn spawn_detached_server(name: &str, command: &[String], cols: u16, rows: u16) -> Result<()> {
+fn spawn_detached_server(
+    name: &str,
+    command: &[String],
+    cols: u16,
+    rows: u16,
+    mode: server::Mode,
+) -> Result<()> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -425,6 +613,9 @@ fn spawn_detached_server(name: &str, command: &[String], cols: u16, rows: u16) -
             .arg(cols.to_string())
             .arg("--rows")
             .arg(rows.to_string());
+        if let server::Mode::Legacy { history } = mode {
+            c.arg("--legacy").arg("--history").arg(history.to_string());
+        }
         if !command.is_empty() {
             // `--` keeps clap from treating the child's own flags as ours.
             c.arg("--");

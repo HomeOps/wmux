@@ -62,13 +62,18 @@ cargo build --release
 |---|---|
 | `wmux new` | Create a session (auto-named) and attach |
 | `wmux new -s NAME` | Create a named session and attach |
-| `wmux new -d -s NAME` | Create it but stay detached |
+| `wmux new -d -s NAME` | Create it but stay detached (a 200x60 screen unless `-x`/`-y` say otherwise) |
+| `wmux new -s NAME -x 132 -y 43` | Create it at an explicit size |
 | `wmux new -s NAME -- pwsh -NoProfile` | Run a specific program |
+| `wmux new -d -s NAME --legacy -- prog.exe` | Host a classic console program in a real, hidden console |
 | `wmux ls` | List running sessions |
 | `wmux attach [NAME]` | Attach; NAME is optional if only one exists |
 | `wmux run -t NAME <cmd>` | Run a PowerShell command, get its result as CLIXML/JSON/text |
 | `wmux send -t NAME <text>` | Type raw keystrokes into a session without attaching |
+| `wmux key -t NAME F1 Alt-F10 Down` | Press named keys without attaching |
 | `wmux capture -t NAME` | Print the session's visible screen as plain text |
+| `wmux capture -t NAME --format json -S 500` | The screen with per-cell colours, plus scrollback |
+| `wmux resize -t NAME -x 160 -y 50` | Resize a session without attaching |
 | `wmux kill NAME` | Terminate a session and its child |
 
 ### Keys
@@ -93,6 +98,61 @@ users already live with. To rebind:
 ```powershell
 $env:WMUX_PREFIX = '^A'    # or any ^X form, or a literal control byte
 ```
+
+### Named keys
+
+`wmux send` types text; `wmux key` presses keys that text cannot express:
+
+```powershell
+wmux key -t ztw F1            # function keys F1-F24
+wmux key -t ztw Alt-F10 C-x   # modifiers: Ctrl-/C-, Alt-/M-, Shift-/S-
+wmux key -t ztw Down Down PgDn Home Enter Esc Tab BSpace Ins Del
+wmux key -t ztw q             # a single character is pressed literally
+```
+
+A ConPTY session receives the xterm escape sequence for each key; a
+`--legacy` session receives a real key record (see below). Either way the
+command returns once the session has consumed the keys.
+
+### Legacy console sessions
+
+Some programs cannot run under a pseudoconsole. They were written against the
+classic console API, and typically ask for their console window with
+`GetConsoleWindow()`; a ConPTY has no real window, so they fail or draw nothing.
+ZTreeWin is one, reporting "cannot get window handle".
+
+`--legacy` gives such a program a real conhost, created with its window
+hidden. wmux reads the screen straight from the console buffer and injects
+input as key records, so everything the program does with the classic API
+works exactly as it would on a desktop:
+
+```powershell
+wmux new -d -s ztw --legacy -- ZTW64.EXE /AUTO X:\src
+wmux capture -t ztw --wait-for COMMANDS
+wmux key -t ztw Down Down F1
+wmux capture -t ztw --format json      # characters and colours
+```
+
+The console is sized *before* the program starts, since many legacy programs
+read the size once at startup. A console window cannot be larger than the
+monitor and font allow, so a requested size is clamped to that limit. Killing
+the session kills the program's whole process tree. `wmux attach` is not
+supported for legacy sessions yet.
+
+### Colours and scrollback
+
+`capture --format json` returns each row twice: as text, and as one console
+attribute per cell, two hex digits each (background then foreground, in the
+classic console palette). `1E` is bright yellow on blue; `70` is black on grey.
+
+```json
+{"cols":200,"rows":49,"history":0,"cursor":{"x":0,"y":48},
+ "lines":[" X:\\src  ...", ...], "attrs":["1E1E1E...", ...]}
+```
+
+ConPTY sessions are mapped to the same 16 colours from the terminal model,
+with 256-colour and RGB values rounded to the nearest. `-S N` prepends up to
+`N` rows of scrollback; `history` says how many of the rows are scrollback.
 
 ### Environment
 
