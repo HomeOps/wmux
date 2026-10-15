@@ -250,8 +250,8 @@ is silently ignored by release-please.
 
 ## Release and winget
 
-`.github/workflows/release.yml` runs release-please, builds an x64 zip, attaches
-it to the GitHub release, and submits a winget manifest update.
+`.github/workflows/release.yml` runs release-please, builds `x64` and `arm64`
+zips, attaches them to the GitHub release, and submits a winget manifest update.
 
 Publishing uses [WinGet Releaser](https://github.com/vedantmgoyal9/winget-releaser),
 the community-standard action that generates most winget-pkgs PRs. It handles
@@ -279,8 +279,17 @@ Two settings that are easy to get wrong:
   secret; the job skips with a warning when it is absent so a release never
   fails just because publishing is not configured.
 
-Set the `WINGET_FORK_USER` repository *variable* if the `winget-pkgs` fork
-lives under an account other than the token owner's.
+**`WINGET_FORK_USER` is required** (repository *variable*, currently
+`ocalvo`). winget-releaser does not fall back to the token owner: when it is
+unset the action receives an empty string and fails with "Could not resolve to
+a Repository with the name '/winget-pkgs'". Releases up to 0.4.0 hit this.
+
+**The fork sync needs the `workflow` scope.** The action merges upstream into
+`ocalvo/winget-pkgs` first, and upstream changes its own workflow files, so a
+PAT without `workflow` fails with "Status 422: refusing to allow a Personal
+Access Token to create or update workflow". Either give `WINGET_TOKEN` the
+`workflow` scope, or sync the fork by hand before re-running the job:
+`gh repo sync ocalvo/winget-pkgs --source microsoft/winget-pkgs --branch master`.
 
 **Signing is not required by winget**, and unsigned portable packages are
 accepted. It does matter for the install experience: unsigned binaries trigger
@@ -321,9 +330,21 @@ Individual developers are eligible for Artifact Signing; the old requirement
 for three years of company trading history was dropped. Identity validation
 needs a government photo ID and a matching selfie.
 
-ARM64 is not built yet; the release workflow ships x64 only. Adding it means
-cross-compiling `aarch64-pc-windows-msvc`, which needs the ARM64 MSVC tools on
-the runner.
+## ARM64
+
+Releases ship `wmux-<ver>-x64.zip` and `wmux-<ver>-arm64.zip`. Both are built
+on the x64 runner: ARM64 is a cross-compile to `aarch64-pc-windows-msvc`, and
+the hosted Visual Studio already has the ARM64 MSVC tools. The build job reads
+each exe's PE `Machine` field (`0x8664` / `0xAA64`) and fails rather than ship
+an x64 binary in the arm64 zip. The `x64` / `arm64` suffix in the zip name is
+what winget-releaser uses to label each installer's architecture.
+
+CI's `Build and test (ARM64)` job runs the unit and e2e suites natively on a
+`windows-11-arm` runner, since a cross-compile proves only that it builds.
+
+Locally: `rustup target add aarch64-pc-windows-msvc`, then
+`cargo build --release --target aarch64-pc-windows-msvc`. It needs the VS
+"MSVC ARM64 build tools" component; Visual Studio Enterprise has it by default.
 
 ---
 *Last garbage-collected: 2026-08-02*

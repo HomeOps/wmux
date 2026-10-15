@@ -41,3 +41,26 @@ jobs:
 
       - name: Release build
         run: cargo build --release
+
+  # The same suite natively on ARM64 Windows. Releases cross-compile ARM64 on
+  # x64, which proves it builds; this proves it works: ConPTY, the legacy
+  # conhost backend, and key injection on real ARM64. Kept as a separate job
+  # so the required "Build and test" check name does not change.
+  check-arm64:
+    name: Build and test (ARM64)
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests
+        run: cargo test --lib --bins
+
+      - name: End-to-end tests
+        run: cargo test --test e2e -- --test-threads=2
+
+      - name: Release build
+        run: cargo build --release

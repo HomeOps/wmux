@@ -50,10 +50,17 @@ different wmux session in each.
 winget install HomeOps.wmux
 ```
 
+Native builds exist for x64 and ARM64 Windows; winget picks the right one.
+They are also attached to each [GitHub release](https://github.com/HomeOps/wmux/releases)
+as `wmux-<version>-x64.zip` and `wmux-<version>-arm64.zip`.
+
 Or build from source (requires Rust 1.77+):
 
 ```powershell
 cargo build --release
+# ARM64 from an x64 machine (needs the VS "MSVC ARM64 build tools"):
+rustup target add aarch64-pc-windows-msvc
+cargo build --release --target aarch64-pc-windows-msvc
 ```
 
 ## Usage
