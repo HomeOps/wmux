@@ -24,17 +24,44 @@ jobs:
           manifest-file: .release-please-manifest.json
 
   build:
-    name: Build release artifact
+    name: Build release artifact (${{ matrix.arch }})
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
+    # Both architectures build on the x64 runner: the hosted Visual Studio
+    # ships the ARM64 MSVC tools, so ARM64 is a plain cross-compile. CI runs
+    # the test suite natively on an ARM64 runner.
     runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            machine: '0x8664'
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            machine: '0xAA64'
+    env:
+      EXE: target\${{ matrix.target }}\release\wmux.exe
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # A cross-compile that silently fell back to the host target would ship
+      # an x64 binary in the arm64 zip. Read the PE header and refuse.
+      - name: Verify architecture
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes($env:EXE)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = '0x{0:X4}' -f [BitConverter]::ToUInt16($bytes, $pe + 4)
+          "Machine: $machine"
+          if ($machine -ne '${{ matrix.machine }}') { throw "expected ${{ matrix.machine }} for ${{ matrix.arch }}, got $machine" }
 
       # Signing is optional so a release never fails just because signing is
       # not configured. Once the four AZURE_SIGNING_* secrets exist, every
@@ -69,7 +96,7 @@ jobs:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE_NAME }}
-          files: ${{ github.workspace }}\target\release\wmux.exe
+          files: ${{ github.workspace }}\${{ env.EXE }}
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -80,7 +107,7 @@ jobs:
         if: steps.signing.outputs.ready == 'true'
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature target\release\wmux.exe
+          $sig = Get-AuthenticodeSignature $env:EXE
           "Status : $($sig.Status)"
           "Signer : $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status), refusing to publish" }
@@ -89,8 +116,10 @@ jobs:
         shell: pwsh
         run: |
           $version = '${{ needs.release-please.outputs.version }}'
-          $zip = "wmux-$version-x64.zip"
-          Compress-Archive -Path 'target/release/wmux.exe', 'README.md', 'LICENSE' -DestinationPath $zip
+          # The architecture in the name is what winget-releaser reads to
+          # label each installer, so keep the x64 / arm64 suffixes.
+          $zip = "wmux-$version-${{ matrix.arch }}.zip"
+          Compress-Archive -Path $env:EXE, 'README.md', 'LICENSE' -DestinationPath $zip
           "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Attach to release
