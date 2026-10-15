@@ -150,6 +150,15 @@ classic console palette). `1E` is bright yellow on blue; `70` is black on grey.
  "lines":[" X:\\src  ...", ...], "attrs":["1E1E1E...", ...]}
 ```
 
+To *look* at a session instead, `--format ansi` redraws it in colour. It
+starts with `CSI 8;rows;cols t` to ask the terminal for the session's size
+(conhost honours it; Windows Terminal ignores it, so widen the window first):
+
+```powershell
+wmux capture -t ztw --format ansi | Write-Host
+wmux capture -t ztw --format ansi > ztw.ans    # Get-Content -Raw ztw.ans | Write-Host
+```
+
 ConPTY sessions are mapped to the same 16 colours from the terminal model,
 with 256-colour and RGB values rounded to the nearest. `-S N` prepends up to
 `N` rows of scrollback; `history` says how many of the rows are scrollback.

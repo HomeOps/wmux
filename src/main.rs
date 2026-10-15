@@ -190,7 +190,8 @@ enum Command {
 
         /// Output format. `json` adds a console attribute per cell (two hex
         /// digits, background then foreground, e.g. 1E is yellow on blue)
-        /// and the cursor position.
+        /// and the cursor position. `ansi` redraws the screen in colour:
+        /// pipe it to Write-Host or save it and `Get-Content -Raw` it later.
         #[arg(long, default_value = "text")]
         format: CaptureFormat,
 
@@ -258,6 +259,7 @@ enum Command {
 enum CaptureFormat {
     Text,
     Json,
+    Ansi,
 }
 
 fn main() {
@@ -522,6 +524,7 @@ fn cmd_capture(
         }
         CaptureFormat::Text => println!("{}", client::snapshot(name, scrollback)?.to_text()),
         CaptureFormat::Json => println!("{}", client::snapshot(name, scrollback)?.to_json()),
+        CaptureFormat::Ansi => println!("{}", client::snapshot(name, scrollback)?.to_ansi()),
     }
     Ok(())
 }

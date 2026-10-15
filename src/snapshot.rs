@@ -128,6 +128,38 @@ impl Snapshot {
         out
     }
 
+    /// The screen as VT text that redraws it in colour on any terminal:
+    /// `Get-Content -Raw file | Write-Host` or straight to the console.
+    ///
+    /// Starts by asking the terminal to become the session's size
+    /// (`CSI 8;rows;cols t`, honoured by conhost and xterm, ignored by
+    /// terminals that do not resize on request), then clears and homes. Each
+    /// run of cells with one attribute gets a single SGR, using the 16 basic
+    /// colours so the output looks the same as the console it came from.
+    pub fn to_ansi(&self) -> String {
+        let mut out = String::with_capacity(self.cells.len() * 2);
+        out.push_str(&format!(
+            "\x1b[8;{};{}t\x1b[2J\x1b[H",
+            self.rows - self.history,
+            self.cols
+        ));
+        for y in 0..self.rows {
+            let mut prev = None;
+            for cell in self.row(y) {
+                if prev != Some(cell.attr) {
+                    out.push_str(&sgr(cell.attr));
+                    prev = Some(cell.attr);
+                }
+                out.push(cell.ch);
+            }
+            out.push_str("\x1b[0m");
+            if y + 1 < self.rows {
+                out.push_str("\r\n");
+            }
+        }
+        out
+    }
+
     /// Wire encoding: five u16 header fields, then `ch u32, attr u8` per cell.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(10 + self.cells.len() * 5);
@@ -311,6 +343,17 @@ fn nearest16(r: u8, g: u8, b: u8) -> u8 {
         .map_or(7, |(i, _)| i as u8)
 }
 
+/// The SGR sequence for a console attribute. Console colours are IRGB and
+/// ANSI ones IBGR, so [`ansi_to_console`] (which swaps red and blue) maps
+/// both ways.
+fn sgr(attr: u8) -> String {
+    let fg = ansi_to_console(attr & 0x0F);
+    let bg = ansi_to_console(attr >> 4);
+    let fg = if fg < 8 { 30 + fg } else { 90 + fg - 8 };
+    let bg = if bg < 8 { 40 + bg } else { 100 + bg - 8 };
+    format!("\x1b[0;{fg};{bg}m")
+}
+
 fn push_json_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
@@ -369,6 +412,25 @@ mod tests {
         assert!(json.contains(r#""lines":["a\" ","   "]"#), "{json}");
         assert!(json.contains(r#""attrs":["1E7007","070707"]"#), "{json}");
         assert!(json.contains(r#""cursor":{"x":1,"y":0}"#), "{json}");
+    }
+
+    #[test]
+    fn ansi_resizes_then_colours_each_run_once() {
+        let ansi = sample().to_ansi();
+        assert!(ansi.starts_with("\x1b[8;2;3t\x1b[2J\x1b[H"), "{ansi:?}");
+        // 1E: bright yellow on blue. 70: black on grey. 07: grey on black.
+        assert!(
+            ansi.contains("\x1b[0;93;44ma\x1b[0;30;47m\"\x1b[0;37;40m \x1b[0m\r\n"),
+            "{ansi:?}"
+        );
+        // The second row is one run, so one SGR.
+        assert!(ansi.ends_with("\x1b[0;37;40m   \x1b[0m"), "{ansi:?}");
+    }
+
+    #[test]
+    fn sgr_covers_bright_backgrounds() {
+        assert_eq!(sgr(0xF0), "\x1b[0;30;107m");
+        assert_eq!(sgr(0x1B), "\x1b[0;96;44m");
     }
 
     #[test]
