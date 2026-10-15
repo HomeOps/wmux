@@ -264,8 +264,17 @@ Two settings that are easy to get wrong:
   secret; the job skips with a warning when it is absent so a release never
   fails just because publishing is not configured.
 
-Set the `WINGET_FORK_USER` repository *variable* if the `winget-pkgs` fork
-lives under an account other than the token owner's.
+**`WINGET_FORK_USER` is required** (repository *variable*, currently
+`ocalvo`). winget-releaser does not fall back to the token owner: when it is
+unset the action receives an empty string and fails with "Could not resolve to
+a Repository with the name '/winget-pkgs'". Releases up to 0.4.0 hit this.
+
+**The fork sync needs the `workflow` scope.** The action merges upstream into
+`ocalvo/winget-pkgs` first, and upstream changes its own workflow files, so a
+PAT without `workflow` fails with "Status 422: refusing to allow a Personal
+Access Token to create or update workflow". Either give `WINGET_TOKEN` the
+`workflow` scope, or sync the fork by hand before re-running the job:
+`gh repo sync ocalvo/winget-pkgs --source microsoft/winget-pkgs --branch master`.
 
 **Signing is not required by winget**, and unsigned portable packages are
 accepted. It does matter for the install experience: unsigned binaries trigger
