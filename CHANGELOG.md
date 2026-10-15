@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/HomeOps/wmux/compare/v0.4.0...v0.5.0) (2026-10-15)
+
+
+### Features
+
+* ship native ARM64 builds ([#13](https://github.com/HomeOps/wmux/issues/13)) ([2e4f5ca](https://github.com/HomeOps/wmux/commit/2e4f5ca7eade2b5dce72a6c1e51be45640a12c57))
+
 ## [0.4.0](https://github.com/HomeOps/wmux/compare/v0.3.2...v0.4.0) (2026-10-15)
 
 
