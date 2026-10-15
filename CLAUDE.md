@@ -41,7 +41,10 @@ Get-Process wmux -ErrorAction SilentlyContinue | Stop-Process -Force
 | `src/protocol.rs` | Length-prefixed frame codec. Hand-rolled; no serde. |
 | `src/pipe.rs` | Named pipe listener and connection, overlapped I/O. |
 | `src/session.rs` | Name validation, pipe paths, discovery, user SID. |
-| `src/server.rs` | ConPTY host, vt100 screen model, client fanout. |
+| `src/server.rs` | Session host: `Backend::Pty` (ConPTY + vt100 model) or `Backend::Legacy`, client fanout. |
+| `src/legacy.rs` | `--legacy` backend: hidden real conhost, `console-host` trampoline, `ReadConsoleOutput` / `WriteConsoleInput`. |
+| `src/keys.rs` | Key names (`F1`, `Alt-F10`, `C-x`) to xterm VT bytes or console key records. |
+| `src/snapshot.rs` | Screen + per-cell console attributes + scrollback; wire codec and JSON. |
 | `src/client.rs` | Attach loop, detach key state machine, resize polling. |
 | `src/run.rs` | PowerShell command execution with structured results. |
 | `src/console.rs` | Raw-mode guard and console size. |
@@ -148,6 +151,54 @@ early, so the wrapper must stay single-line and `run` rejects a multi-line
 command. Paths interpolated into it go through `ps_single_quote`, which doubles
 `'` — PowerShell single-quoted literals have no other escape, and backslashes
 are *not* escapes.
+
+## Legacy console gotchas
+
+**Some programs cannot run under ConPTY at all.** A pseudoconsole has no real
+window, so a program that calls `GetConsoleWindow()` to size itself (ZTreeWin:
+"cannot get window handle") draws nothing and waits forever. No resize or key
+fixes that; it needs a real conhost. That is what `--legacy` is for.
+
+**The console must be sized before the program starts.** Legacy programs often
+read the size once at startup (`ZTW /AUTO`). The server cannot size a console
+it does not have yet, so it launches `wmux console-host` (hidden `SW_HIDE`,
+`CREATE_NEW_CONSOLE`), which sizes its own console and only then runs the
+program. A `CREATE_SUSPENDED` child does not work: its console is attached
+during the child's own startup, so `AttachConsole` on it fails.
+
+**Clamp to `GetLargestConsoleWindowSize`.** The window cannot exceed what the
+monitor and font allow: 200x60 became 200x49 on a 1080p screen.
+`SetConsoleWindowInfo` fails outright otherwise. The host clamps;
+`wmux resize` reports the size the console actually ended up at.
+
+**Reopen `CONOUT$` for every read.** A program may switch screen buffers with
+`SetConsoleActiveScreenBuffer` at any time, and a handle opened earlier keeps
+pointing at the old one.
+
+**Pace injected keys.** Write one key's down/up pair, then poll
+`GetNumberOfConsoleInputEvents` until the program has drained it (1 s cap).
+Full-screen programs flush the input buffer when a dialog opens, so a burst of
+keys loses everything after the one that opened it.
+
+**The host's Ctrl-C handler must be a routine, not `SetConsoleCtrlHandler(NULL,
+TRUE)`.** The NULL form is inherited, and would stop Ctrl-C reaching the
+program. The server, which spawns nothing into that console, uses the NULL form.
+
+## Other gotchas
+
+**vt100 0.15 panics on a scrollback offset larger than the screen.**
+`Grid::visible_rows` computes `rows - scrollback_offset` unchecked.
+`Snapshot::from_vt100` temporarily grows the model by the history it wants
+(blank rows at the bottom, width unchanged, so nothing reflows) and shrinks it
+back. Do not "simplify" this into paging with `set_scrollback`.
+
+**pwsh prints no colour when `NO_COLOR` is set**, and some environments set it
+(Claude Code does). The e2e helper removes it from the server's environment;
+any colour test that spawns pwsh itself must do the same.
+
+**In PowerShell, setting a field of a nested struct mutates a copy.**
+`$rec.Key.bKeyDown = 1` on an `INPUT_RECORD` silently does nothing. Build
+Win32 structs in C# (`Add-Type`) when prototyping from PowerShell.
 
 ## Testing
 
