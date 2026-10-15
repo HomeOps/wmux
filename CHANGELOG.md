@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/HomeOps/wmux/compare/v0.5.0...v0.5.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* keep legacy console windows off the user's desktop ([#15](https://github.com/HomeOps/wmux/issues/15)) ([9b78d72](https://github.com/HomeOps/wmux/commit/9b78d722fae106ed86e8849b2f2a2ab2c8fb5811))
+
 ## [0.5.0](https://github.com/HomeOps/wmux/compare/v0.4.0...v0.5.0) (2026-10-15)
 
 
