@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/HomeOps/wmux/compare/v0.3.2...v0.4.0) (2026-10-15)
+
+
+### Features
+
+* add legacy console sessions, named keys and colour capture ([#10](https://github.com/HomeOps/wmux/issues/10)) ([15bc1b6](https://github.com/HomeOps/wmux/commit/15bc1b64f9c01281879e8340acbd0354e0ae4a12))
+
 ## [0.3.2](https://github.com/HomeOps/wmux/compare/v0.3.1...v0.3.2) (2026-08-03)
 
 
