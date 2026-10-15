@@ -16,12 +16,40 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
+      # JSON of the release PR when one was opened or updated, else empty.
+      pr: ${{ steps.release.outputs.pr }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          # A PAT, not GITHUB_TOKEN. GitHub never triggers workflows from
+          # events made with GITHUB_TOKEN, so with it CI would not run on the
+          # release PR (auto-merge would wait forever), and merging the PR
+          # would not trigger the run that tags and publishes the release.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+  automerge:
+    name: Auto-merge release PR
+    needs: release-please
+    if: needs.release-please.outputs.pr != ''
+    runs-on: ubuntu-latest
+    steps:
+      # GitHub's native auto-merge: the PR is squash-merged by GitHub itself
+      # the moment every *required* status check on main passes, and never
+      # if one fails. Requires "Allow auto-merge" in the repository settings
+      # and a branch protection rule on main requiring the CI check.
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ fromJSON(needs.release-please.outputs.pr).number }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::RELEASE_PLEASE_TOKEN is not set; release PR #$PR_NUMBER must be merged by hand."
+            exit 0
+          fi
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
 
   build:
     name: Build release artifact
