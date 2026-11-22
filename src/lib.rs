@@ -22,6 +22,8 @@
 
 pub mod client;
 pub mod console;
+pub mod default_host;
+pub mod handoff;
 pub mod input;
 pub mod keys;
 pub mod legacy;

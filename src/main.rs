@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use wmux::{client, console, protocol, run, server, session};
+use wmux::{client, console, default_host, protocol, run, server, session};
 
 /// Creation flags for the detached server process.
 ///
@@ -224,6 +224,18 @@ enum Command {
     /// what the detach detector sees.
     Keys,
 
+    /// Make wmux the default terminal, so console programs started without a
+    /// window (Start menu, Explorer, Win+R, shortcuts) run in wmux sessions.
+    ///
+    /// Each program gets a session named after it, such as cmd-4120. One
+    /// that exits with a non-zero code stays in `wmux ls` until you attach to
+    /// it or kill it, so its output is never lost.
+    #[command(name = "default-host")]
+    DefaultHost {
+        #[command(subcommand)]
+        action: DefaultHostAction,
+    },
+
     /// Internal: run the session server in this process.
     #[command(hide = true)]
     Server {
@@ -237,8 +249,19 @@ enum Command {
         legacy: bool,
         #[arg(long, default_value_t = 0)]
         history: u16,
+        /// Keep the session after its program exits with a non-zero code.
+        #[arg(long)]
+        keep_failed: bool,
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+    },
+
+    /// Internal: the COM server Windows starts for a default-terminal handoff.
+    #[command(hide = true)]
+    ComServer {
+        /// COM appends -Embedding.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _ignored: Vec<String>,
     },
 
     /// Internal: the trampoline inside a legacy session's hidden console.
@@ -253,6 +276,23 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum DefaultHostAction {
+    /// Register wmux as the default terminal. Needs Windows Terminal or
+    /// Windows Terminal Preview installed, for its OpenConsole.
+    Enable {
+        /// Also show each program through the terminal that was the default
+        /// before: Windows Terminal Preview, Windows Terminal, or a console
+        /// window. The session is kept either way.
+        #[arg(long)]
+        visible: bool,
+    },
+    /// Restore the default terminal that was set before.
+    Disable,
+    /// Show whether wmux is the default terminal.
+    Status,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -270,6 +310,16 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // Before parsing, so even a usage error has a console to be printed on.
+    // The session servers are the exception: they must stay console-less, and
+    // `com-server` getting a console while wmux is the default terminal would
+    // hand that console to itself and deadlock.
+    let console_less = std::env::args()
+        .nth(1)
+        .is_some_and(|c| c == "server" || c == "com-server");
+    if !console_less {
+        wmux::console::ensure_console();
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::New {
@@ -314,12 +364,18 @@ fn run() -> Result<()> {
         Command::Kill { name } => cmd_kill(&name),
         Command::Detach { name } => cmd_detach(name),
         Command::Keys => cmd_keys(),
+        Command::DefaultHost { action } => match action {
+            DefaultHostAction::Enable { visible } => default_host::enable(visible),
+            DefaultHostAction::Disable => default_host::disable(),
+            DefaultHostAction::Status => default_host::status(),
+        },
         Command::Server {
             name,
             cols,
             rows,
             legacy,
             history,
+            keep_failed,
             command,
         } => {
             let mode = if legacy {
@@ -327,8 +383,16 @@ fn run() -> Result<()> {
             } else {
                 server::Mode::Pty
             };
-            server::run(&name, &command, cols, rows, mode)
+            server::run(
+                &name,
+                &command,
+                cols,
+                rows,
+                mode,
+                server::ExitPolicy { keep_failed },
+            )
         }
+        Command::ComServer { .. } => wmux::handoff::com_server_main(),
         Command::ConsoleHost {
             cols,
             rows,
@@ -401,10 +465,15 @@ fn cmd_ls() -> Result<()> {
                 cols,
                 rows,
                 clients,
+                exited,
                 command,
             }) => {
-                let attached = if clients > 0 { "attached" } else { "detached" };
-                println!("{name}\t{cols}x{rows}\t{attached}\t{command}");
+                let state = match exited {
+                    Some(code) => format!("exited {code}"),
+                    None if clients > 0 => "attached".to_string(),
+                    None => "detached".to_string(),
+                };
+                println!("{name}\t{cols}x{rows}\t{state}\t{command}");
             }
             // The session went away between listing and querying, or is busy.
             _ => println!("{name}\t?"),

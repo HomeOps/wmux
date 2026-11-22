@@ -38,6 +38,13 @@ fn main() {
 
     // Declaring asInvoker states plainly that wmux never wants elevation, and
     // marks it long-path aware so deep session paths behave.
+    //
+    // consoleAllocationPolicy=detached (Windows 11 24H2+): started without a
+    // parent console, wmux gets none. COM starts `wmux com-server` exactly
+    // that way, and with wmux as the default terminal a console of its own
+    // would be handed off to wmux, which cannot answer until it has started:
+    // a deadlock. Run from a terminal, wmux still inherits that console, and
+    // CREATE_NEW_CONSOLE still gives the children that ask for one a console.
     resource.set_manifest(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
@@ -52,6 +59,7 @@ fn main() {
     <windowsSettings>
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <consoleAllocationPolicy xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">detached</consoleAllocationPolicy>
     </windowsSettings>
   </application>
 </assembly>

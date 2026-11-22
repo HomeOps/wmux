@@ -37,11 +37,15 @@ mod tag {
     pub const REPAINT: u8 = 0x81;
     pub const OUTPUT: u8 = 0x82;
     pub const EXITED: u8 = 0x83;
-    pub const INFO_REPLY: u8 = 0x84;
     pub const CAPTURE_REPLY: u8 = 0x85;
     pub const DETACHED: u8 = 0x86;
     pub const SNAPSHOT_REPLY: u8 = 0x87;
     pub const ERROR: u8 = 0x88;
+    /// The original info reply. Only read, never written: a 0.5.x server that
+    /// is still running sends it.
+    pub const INFO_REPLY_V1: u8 = 0x84;
+    /// V1 plus the exit status of a session kept after its program failed.
+    pub const INFO_REPLY_V2: u8 = 0x89;
 }
 
 /// A message sent from an attaching client to the session server.
@@ -85,13 +89,17 @@ pub enum ServerMsg {
     Repaint(Vec<u8>),
     /// Live pty output.
     Output(Vec<u8>),
-    /// The child process exited with this code; the session is going away.
+    /// The child process exited with this code. The session goes away, unless
+    /// it keeps failed programs, in which case it stays to be inspected.
     Exited(i32),
     /// Reply to [`ClientMsg::Info`].
     InfoReply {
         cols: u16,
         rows: u16,
         clients: u32,
+        /// The exit code of a program that has ended while its session was
+        /// kept for inspection; `None` while it is still running.
+        exited: Option<i32>,
         command: String,
     },
     /// Reply to [`ClientMsg::Capture`]: the visible screen, newline separated,
@@ -230,12 +238,15 @@ impl ServerMsg {
                 cols,
                 rows,
                 clients,
+                exited,
                 command,
             } => {
                 let mut payload = dims_payload(*cols, *rows);
                 payload.extend_from_slice(&clients.to_le_bytes());
+                payload.push(u8::from(exited.is_some()));
+                payload.extend_from_slice(&exited.unwrap_or(0).to_le_bytes());
                 payload.extend_from_slice(command.as_bytes());
-                write_frame(w, tag::INFO_REPLY, &payload)
+                write_frame(w, tag::INFO_REPLY_V2, &payload)
             }
             ServerMsg::CaptureReply(text) => write_frame(w, tag::CAPTURE_REPLY, text.as_bytes()),
             ServerMsg::Detached => write_frame(w, tag::DETACHED, &[]),
@@ -257,17 +268,22 @@ impl ServerMsg {
                     payload[0], payload[1], payload[2], payload[3],
                 ])))
             }
-            tag::INFO_REPLY => {
-                if payload.len() < 8 {
+            tag::INFO_REPLY_V1 | tag::INFO_REPLY_V2 => {
+                let header = if tag == tag::INFO_REPLY_V2 { 13 } else { 8 };
+                if payload.len() < header {
                     return Err(bad("truncated info reply"));
                 }
                 let (cols, rows) = dims(&payload)?;
                 let clients = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                let command = String::from_utf8_lossy(&payload[8..]).into_owned();
+                let exited = (tag == tag::INFO_REPLY_V2 && payload[8] != 0).then(|| {
+                    i32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]])
+                });
+                let command = String::from_utf8_lossy(&payload[header..]).into_owned();
                 Ok(ServerMsg::InfoReply {
                     cols,
                     rows,
                     clients,
+                    exited,
                     command,
                 })
             }
@@ -334,7 +350,15 @@ mod tests {
             cols: 100,
             rows: 40,
             clients: 2,
+            exited: None,
             command: "pwsh.exe".into(),
+        });
+        roundtrip_server(ServerMsg::InfoReply {
+            cols: 80,
+            rows: 25,
+            clients: 0,
+            exited: Some(-1073741510),
+            command: "[default-host] cmd.exe /c exit 3".into(),
         });
         roundtrip_server(ServerMsg::CaptureReply("PS X:\\> echo hi\nhi\n".into()));
         roundtrip_server(ServerMsg::Snapshot(Snapshot::blank(4, 2)));
@@ -347,6 +371,33 @@ mod tests {
         write_frame(&mut buf, tag::KEYS, &[1, 101, 0, 0, 0]).unwrap();
         let err = ClientMsg::read_from(&mut Cursor::new(buf)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A 0.5.x server answers `Info` with the original frame, which has no
+    /// exit status. A newer `wmux ls` must still read it.
+    #[test]
+    fn an_info_reply_from_an_older_server_still_decodes() {
+        let cols: u16 = 120;
+        let rows: u16 = 30;
+        let clients: u32 = 1;
+        let command = "pwsh.exe";
+        let mut payload = dims_payload(cols, rows);
+        payload.extend_from_slice(&clients.to_le_bytes());
+        payload.extend_from_slice(command.as_bytes());
+        let mut buf = Vec::new();
+        write_frame(&mut buf, tag::INFO_REPLY_V1, &payload).unwrap();
+
+        let msg = ServerMsg::read_from(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(
+            msg,
+            ServerMsg::InfoReply {
+                cols,
+                rows,
+                clients,
+                exited: None,
+                command: command.into(),
+            }
+        );
     }
 
     #[test]

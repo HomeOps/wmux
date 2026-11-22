@@ -170,6 +170,41 @@ ConPTY sessions are mapped to the same 16 colours from the terminal model,
 with 256-colour and RGB values rounded to the nearest. `-S N` prepends up to
 `N` rows of scrollback; `history` says how many of the rows are scrollback.
 
+### wmux as the default terminal
+
+```powershell
+wmux default-host enable            # console programs run invisibly in wmux sessions
+wmux default-host enable --visible  # ...and are also shown in a window
+wmux default-host status
+wmux default-host disable           # put the previous default back
+```
+
+Once enabled, every console program started *without* a console (Start menu,
+Explorer, Win+R, a shortcut) gets a wmux session named after it, such as
+`cmd-4120`. Programs started from an existing terminal are not affected.
+
+```text
+> wmux ls
+cmd-4120    120x30  detached   [default-host] C:\Windows\System32\cmd.exe
+build-9932  120x30  exited 1   [default-host] build.cmd
+```
+
+A program that exits with code 0 disappears with its session. One that fails
+stays in `wmux ls` as `exited N`, so `wmux attach build-9932` from any console
+shows its last screen and exit code. `wmux kill` removes it.
+
+`--visible` makes wmux a proxy: the program still runs in a wmux session, and
+wmux opens a viewer on it through the terminal that was the default before
+(or Windows Terminal Preview, then Windows Terminal, then a plain console
+window). Closing that window leaves the session running.
+
+This is the same setting as Settings › For developers › Terminal, which lists
+only packaged apps, so wmux writes it directly; while enabled, Settings may show
+the choice as unrecognised. It needs Windows 11 24H2 or later, and Windows
+Terminal or Windows Terminal Preview installed (Preview is preferred): their OpenConsole is the console half
+of the handoff, and wmux uses the installed copy rather than shipping its own.
+Everything is registered under `HKCU`, so no administrator rights are needed.
+
 ### Environment
 
 | Variable | Effect |
