@@ -23,14 +23,11 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(90);
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
 
-/// Locates the `wmux` binary that cargo just built, next to the test binary.
+/// The `wmux` binary cargo built for this test run. Cargo sets the path;
+/// deriving it from the test executable breaks whenever the target layout
+/// changes.
 fn wmux_exe() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().expect("test executable path");
-    path.pop();
-    if path.file_name().is_some_and(|f| f == "deps") {
-        path.pop();
-    }
-    path.join("wmux.exe")
+    env!("CARGO_BIN_EXE_wmux").into()
 }
 
 /// A server process plus its session name, killed when the test ends.
