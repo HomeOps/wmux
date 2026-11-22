@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/HomeOps/wmux/compare/v0.5.1...v0.5.2) (2026-11-22)
+
+
+### Bug Fixes
+
+* find the built wmux binary in end-to-end tests ([#20](https://github.com/HomeOps/wmux/issues/20)) ([4c55f95](https://github.com/HomeOps/wmux/commit/4c55f952a4b71b6eca38f6a026e8fbe44ec35f0f))
+
 ## [0.5.1](https://github.com/HomeOps/wmux/compare/v0.5.0...v0.5.1) (2026-10-15)
 
 
