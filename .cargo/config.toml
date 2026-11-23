@@ -1,0 +1,8 @@
+# Link the C runtime into wmux.exe. A portable zip has no installer to bring
+# the VC++ redistributable, and a machine without it (often a clean ARM64 one)
+# cannot start the exe at all.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

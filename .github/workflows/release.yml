@@ -91,6 +91,14 @@ jobs:
           "Machine: $machine"
           if ($machine -ne '${{ matrix.machine }}') { throw "expected ${{ matrix.machine }} for ${{ matrix.arch }}, got $machine" }
 
+      # The zip has no installer to bring the VC++ runtime (.cargo/config.toml).
+      - name: Verify the C runtime is linked in
+        shell: pwsh
+        run: |
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($env:EXE))
+          $dlls = [regex]::Matches($text, '(?i)(vcruntime\d+|msvcp\d+|api-ms-win-crt-[a-z-]+\d)\.dll') | ForEach-Object Value | Sort-Object -Unique
+          if ($dlls) { throw "wmux.exe still needs the VC++ runtime: $($dlls -join ', ')" }
+
       # Signing is optional so a release never fails just because signing is
       # not configured. Once the four AZURE_SIGNING_* secrets exist, every
       # release is signed automatically.
