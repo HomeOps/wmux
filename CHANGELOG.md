@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/HomeOps/wmux/compare/v0.6.0...v0.6.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* let wmux start on machines without the VC++ runtime ([#23](https://github.com/HomeOps/wmux/issues/23)) ([b1d9f26](https://github.com/HomeOps/wmux/commit/b1d9f2609ae9ba37a15b35270827759483ad75fa))
+
 ## [0.6.0](https://github.com/HomeOps/wmux/compare/v0.5.2...v0.6.0) (2026-11-23)
 
 
