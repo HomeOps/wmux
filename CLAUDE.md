@@ -42,6 +42,8 @@ Get-Process wmux -ErrorAction SilentlyContinue | Stop-Process -Force
 | `src/pipe.rs` | Named pipe listener and connection, overlapped I/O. |
 | `src/session.rs` | Name validation, pipe paths, discovery, user SID. |
 | `src/server.rs` | Session host: `Backend::Pty` (ConPTY + vt100 model) or `Backend::Legacy`, client fanout. |
+| `src/handoff.rs` | Default-terminal handoff: hand-rolled COM local server for `ITerminalHandoff3`, relay for `--visible`. |
+| `src/default_host.rs` | `wmux default-host`: per-user registry for the delegation pair, COM classes and proxy. |
 | `src/legacy.rs` | `--legacy` backend: hidden real conhost, `console-host` trampoline, `ReadConsoleOutput` / `WriteConsoleInput`. |
 | `src/keys.rs` | Key names (`F1`, `Alt-F10`, `C-x`) to xterm VT bytes or console key records. |
 | `src/snapshot.rs` | Screen + per-cell console attributes + scrollback; wire codec and JSON. |
@@ -193,6 +195,58 @@ keys loses everything after the one that opened it.
 **The host's Ctrl-C handler must be a routine, not `SetConsoleCtrlHandler(NULL,
 TRUE)`.** The NULL form is inherited, and would stop Ctrl-C reaching the
 program. The server, which spawns nothing into that console, uses the NULL form.
+
+## Default-terminal handoff gotchas
+
+**wmux is only the terminal half.** Inbox conhost hands a new console to the
+`DelegationConsole` over `IConsoleHandoff`; that has to be OpenConsole, a full
+console server wmux will not reimplement. OpenConsole then calls wmux's
+`ITerminalHandoff3`. The interface definitions live in microsoft/terminal at
+`src/host/proxy/*.idl`.
+
+**Never ship or copy OpenConsole; use the installed Windows Terminal's.**
+They are not our binaries. `enable` finds the package by family name
+(`GetPackagesByPackageFamily`, what `Get-AppxPackage` uses), Preview first,
+and sets `DelegationConsole` to that package's OpenConsole CLSID (Preview
+`{06EC847C-…}`, stable `{2EACA947-…}`). The package's manifest already
+registers OpenConsole and the proxy that marshals the handoff interfaces in
+the packaged COM catalog, which unpackaged processes (inbox conhost, wmux)
+see, so wmux registers only its own class.
+
+**In `ITerminalHandoff3`, `in` and `out` are `[out]`.** The terminal creates
+the pipes and returns OpenConsole's ends; COM closes ours after duplicating
+them, so give up ownership. The other handles are `[in]` and COM closes them
+when the call returns, so duplicate before keeping them.
+
+**Resizing is a packet on the signal pipe:** three little-endian u16s,
+`8, cols, rows`, the same thing `ResizePseudoConsole` writes.
+
+**Close the reference handle after the program exits.** Holding it keeps the
+console alive, so OpenConsole never flushes the last output or closes the pipe,
+and a kept session would show a stale screen.
+
+**`wmux com-server` must never get a console.** COM starts it with no parent
+console, so a plain console exe gets a fresh one, and with wmux as the
+default terminal that console is handed off to wmux, which cannot answer
+because it is still starting: every console program hangs. The manifest in
+`build.rs` sets `consoleAllocationPolicy=detached` (24H2+, so `enable`
+refuses older builds). Under that policy even `CREATE_NEW_CONSOLE` gives the
+child no console (the spec draft said otherwise; the shipped build does not),
+so `main` calls `console::ensure_console()` (`AllocConsoleWithOptions`,
+default mode) for every command except `server` and `com-server`.
+
+**`REGCLS_SINGLEUSE`, one process per handoff.** That matches
+one-server-per-session; the server never has to multiplex consoles.
+
+**`--visible` must never use a plain new console to reach another terminal.**
+The viewer is `wmux attach` in a new console, which itself goes through the
+handoff and comes back to wmux; wmux relays a handoff whose client is
+`wmux.exe` instead of wrapping it. Without that rule a viewer would open a
+session that opens a viewer, forever.
+
+**Register the exe that ran `enable`,** unless it is winget's copy, in which
+case register winget's link: the versioned package directory changes on every
+upgrade. A source build must not silently register an older installed wmux.
 
 ## Other gotchas
 

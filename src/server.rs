@@ -9,13 +9,16 @@
 //!   past there is no way to ask Windows what the screen currently looks like.
 //!   By replaying the stream into a terminal model we can render the *current*
 //!   screen for a client that shows up ten minutes later.
+//!   The same model also serves a **default-terminal handoff**, where Windows
+//!   Terminal's OpenConsole is the pseudoconsole and wmux only receives its
+//!   pipes; see [`crate::handoff`].
 //! * **Legacy console** (`--legacy`). A real conhost with a hidden window, for
 //!   programs that cannot run under a pseudoconsole. The screen is read
 //!   straight from the console buffer; see [`crate::legacy`].
 
 use anyhow::{Context, Result};
 use std::io::Read;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -41,6 +44,10 @@ const PTY_CHUNK: usize = 8 * 1024;
 /// session — which is exactly what happened before this queue existed.
 const OUTBOUND_QUEUE: usize = 1024;
 
+/// How long a handed-off session waits, after its program exits, for the
+/// console host to deliver the last of its output.
+const FINAL_OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What `attach` says about a legacy session. Interactive attach needs a
 /// renderer that turns the console buffer into VT and key records back into
 /// input; until that exists, say so plainly rather than show a blank screen.
@@ -63,12 +70,56 @@ struct Client {
     outbound: std::sync::mpsc::SyncSender<ServerMsg>,
 }
 
+/// What a session does to its pseudoconsole besides reading and writing it.
+///
+/// Implemented once for a ConPTY wmux created itself and once for one handed
+/// over by Windows, so the terminal model, repaint and capture paths are
+/// shared rather than duplicated.
+pub(crate) trait PtyControl: Send {
+    /// `(cols, rows)`, the wire order.
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<()>;
+    fn kill(&mut self);
+    /// Closes the pseudoconsole once its program has ended. Runs only for a
+    /// session that is kept after a failure.
+    fn release(&mut self) {}
+}
+
+struct OwnedPty {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+}
+
+impl PtyControl for OwnedPty {
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        // PtySize is a struct, so the order cannot be transposed here.
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+    }
+
+    fn kill(&mut self) {
+        let _ = self.killer.kill();
+    }
+}
+
 struct Pty {
     parser: Mutex<vt100::Parser>,
     writer: Mutex<Box<dyn std::io::Write + Send>>,
-    master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
-    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    control: Mutex<Box<dyn PtyControl>>,
     size: Mutex<(u16, u16)>,
+}
+
+/// What happens when a session's program ends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExitPolicy {
+    /// Keep the session after a non-zero exit, so its last screen can still
+    /// be listed, captured and attached to until someone kills it. Nobody
+    /// watches a program wmux hosts as the default terminal, so this is the
+    /// only way its failure is ever seen.
+    pub keep_failed: bool,
 }
 
 enum Backend {
@@ -82,9 +133,57 @@ struct Session {
     clients: Mutex<Vec<Client>>,
     command: String,
     next_client_id: AtomicU64,
+    policy: ExitPolicy,
+    /// Set once the program has ended in a session that is kept.
+    exited: Mutex<Option<i32>>,
+    /// `wmux kill` ended the program, so its exit code is ours, not a failure.
+    killed: AtomicBool,
 }
 
 impl Session {
+    fn new(backend: Backend, command: String, policy: ExitPolicy) -> Arc<Session> {
+        Arc::new(Session {
+            backend,
+            clients: Mutex::new(Vec::new()),
+            command,
+            next_client_id: AtomicU64::new(1),
+            policy,
+            exited: Mutex::new(None),
+            killed: AtomicBool::new(false),
+        })
+    }
+
+    fn exit_code(&self) -> Option<i32> {
+        *self.exited.lock().unwrap()
+    }
+
+    /// Whether a program that ended with `code` leaves the session behind.
+    fn keeps(&self, code: i32) -> bool {
+        code != 0 && self.policy.keep_failed && !self.killed.load(Ordering::SeqCst)
+    }
+
+    /// The program has ended. Either the server exits with it, or, for a
+    /// failure in a session that keeps failures, it stays up holding the
+    /// final screen.
+    fn finish(&self, code: i32) {
+        self.broadcast(&ServerMsg::Exited(code));
+        if self.keeps(code) {
+            log(&format!(
+                "program failed with code {code}; keeping the session"
+            ));
+            *self.exited.lock().unwrap() = Some(code);
+            // Attached clients have been told; they return to their shell.
+            self.clients.lock().unwrap().clear();
+            if let Backend::Pty(pty) = &self.backend {
+                pty.control.lock().unwrap().release();
+            }
+            return;
+        }
+        // Let the per-client writer threads drain before the pipe disappears.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::process::exit(code);
+    }
+
     /// Queues a message for every attached client.
     ///
     /// Never blocks: each client owns a bounded queue drained by its own
@@ -119,14 +218,13 @@ impl Session {
                     }
                     *size = (cols, rows);
                 }
-                // vt100 takes (rows, cols); PtySize is a struct so it is unambiguous.
+                // vt100 takes (rows, cols).
                 pty.parser.lock().unwrap().set_size(rows, cols);
-                let _ = pty.master.lock().unwrap().resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
+                if self.exit_code().is_none() {
+                    if let Err(e) = pty.control.lock().unwrap().resize(cols, rows) {
+                        log(&format!("pty resize to {cols}x{rows} failed: {e:#}"));
+                    }
+                }
             }
             // A refused size is visible to the caller through `Info`, which
             // reports what the console actually is.
@@ -148,6 +246,9 @@ impl Session {
     /// Typed input. A legacy console reads key records, so text is converted
     /// to the keypresses that would have produced it.
     fn input(&self, bytes: &[u8]) -> Result<()> {
+        if let Some(code) = self.exit_code() {
+            anyhow::bail!("the program exited with code {code}; nothing is reading input");
+        }
         match &self.backend {
             Backend::Pty(pty) => {
                 use std::io::Write;
@@ -202,10 +303,14 @@ impl Session {
     }
 
     fn kill(&self) {
+        // A kept session has no program left; killing it removes the session.
+        if let Some(code) = self.exit_code() {
+            log("kept session killed");
+            std::process::exit(code);
+        }
+        self.killed.store(true, Ordering::SeqCst);
         match &self.backend {
-            Backend::Pty(pty) => {
-                let _ = pty.killer.lock().unwrap().kill();
-            }
+            Backend::Pty(pty) => pty.control.lock().unwrap().kill(),
             Backend::Legacy(legacy) => legacy.kill(),
         }
     }
@@ -239,25 +344,95 @@ impl Session {
 
 /// Runs a session server in the current process. Never returns normally: it
 /// exits the process when the child terminates or a client asks it to.
-pub fn run(name: &str, command: &[String], cols: u16, rows: u16, mode: Mode) -> Result<()> {
-    session::validate_name(name)?;
-    let sid = session::current_user_sid()?;
-    let path = session::pipe_path_for(&sid, name);
-
+pub fn run(
+    name: &str,
+    command: &[String],
+    cols: u16,
+    rows: u16,
+    mode: Mode,
+    policy: ExitPolicy,
+) -> Result<()> {
     // Claim the name first. If another server already owns it we want to fail
     // now rather than after spawning a shell nobody can reach.
-    let mut listener = PipeListener::bind(&path, &sid)
-        .with_context(|| format!("session {name:?} is already running"))?;
-    log(&format!("listening on {}", listener.path()));
+    let listener = bind(name)?;
 
     let cols = cols.max(1);
     let rows = rows.max(1);
 
     let sess = match mode {
-        Mode::Pty => start_pty(name, command, cols, rows)?,
-        Mode::Legacy { history } => start_legacy(name, command, cols, rows, history)?,
+        Mode::Pty => start_pty(name, command, cols, rows, policy)?,
+        Mode::Legacy { history } => start_legacy(name, command, cols, rows, history, policy)?,
     };
+    serve(listener, sess)
+}
 
+/// A pseudoconsole somebody else created, handed to wmux to host.
+pub(crate) struct ForeignPty {
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn std::io::Write + Send>,
+    pub control: Box<dyn PtyControl>,
+    /// Blocks until the program ends and returns its exit code.
+    pub wait: Box<dyn FnOnce() -> i32 + Send>,
+}
+
+/// Hosts a pseudoconsole that was created elsewhere: the default-terminal
+/// handoff, where OpenConsole owns the console and wmux gets its pipes.
+pub(crate) fn run_foreign(
+    listener: PipeListener,
+    pty: ForeignPty,
+    cols: u16,
+    rows: u16,
+    command: String,
+    policy: ExitPolicy,
+) -> Result<()> {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let mut control = pty.control;
+    // The console was created at whatever size its program asked for. Make it
+    // agree with the model before the first byte is parsed.
+    if let Err(e) = control.resize(cols, rows) {
+        log(&format!("initial resize to {cols}x{rows} failed: {e:#}"));
+    }
+    let sess = Session::new(
+        Backend::Pty(Box::new(Pty {
+            parser: Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)),
+            writer: Mutex::new(pty.writer),
+            control: Mutex::new(control),
+            size: Mutex::new((cols, rows)),
+        })),
+        command,
+        policy,
+    );
+    let pump = spawn_pty_pump(sess.clone(), pty.reader);
+    let reaper = sess.clone();
+    let wait = pty.wait;
+    std::thread::spawn(move || {
+        let code = wait();
+        log(&format!("handed-off program exited with code {code}"));
+        // The program can exit before its last output has crossed the pipe.
+        // A kept session exists to show that output, so wait for the console
+        // host to close the pipe, within reason.
+        let deadline = std::time::Instant::now() + FINAL_OUTPUT_WAIT;
+        while !pump.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        reaper.finish(code);
+    });
+    serve(listener, sess)
+}
+
+/// Claims a session name by creating its pipe.
+pub(crate) fn bind(name: &str) -> Result<PipeListener> {
+    session::validate_name(name)?;
+    let sid = session::current_user_sid()?;
+    let path = session::pipe_path_for(&sid, name);
+    let listener = PipeListener::bind(&path, &sid)
+        .with_context(|| format!("session {name:?} is already running"))?;
+    log(&format!("listening on {}", listener.path()));
+    Ok(listener)
+}
+
+fn serve(mut listener: PipeListener, sess: Arc<Session>) -> Result<()> {
     // Accept loop. Each client gets a thread; there are never many.
     loop {
         match listener.accept() {
@@ -277,7 +452,13 @@ pub fn run(name: &str, command: &[String], cols: u16, rows: u16, mode: Mode) -> 
     }
 }
 
-fn start_pty(name: &str, command: &[String], cols: u16, rows: u16) -> Result<Arc<Session>> {
+fn start_pty(
+    name: &str,
+    command: &[String],
+    cols: u16,
+    rows: u16,
+    policy: ExitPolicy,
+) -> Result<Arc<Session>> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -318,18 +499,19 @@ fn start_pty(name: &str, command: &[String], cols: u16, rows: u16) -> Result<Arc
         .take_writer()
         .context("failed to take the pty writer")?;
 
-    let sess = Arc::new(Session {
-        backend: Backend::Pty(Box::new(Pty {
+    let sess = Session::new(
+        Backend::Pty(Box::new(Pty {
             parser: Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)),
             writer: Mutex::new(writer),
-            master: Mutex::new(pair.master),
-            killer: Mutex::new(killer),
+            control: Mutex::new(Box::new(OwnedPty {
+                master: pair.master,
+                killer,
+            })),
             size: Mutex::new((cols, rows)),
         })),
-        clients: Mutex::new(Vec::new()),
-        command: command.join(" "),
-        next_client_id: AtomicU64::new(1),
-    });
+        command.join(" "),
+        policy,
+    );
 
     spawn_pty_pump(sess.clone(), reader);
     spawn_child_reaper(sess.clone(), child);
@@ -342,16 +524,16 @@ fn start_legacy(
     cols: u16,
     rows: u16,
     history: u16,
+    policy: ExitPolicy,
 ) -> Result<Arc<Session>> {
     // The console host and the program inherit this process's environment.
     std::env::set_var(session::SESSION_ENV, name);
     let legacy = Legacy::spawn(command, cols, rows, history)?;
-    let sess = Arc::new(Session {
-        backend: Backend::Legacy(legacy),
-        clients: Mutex::new(Vec::new()),
-        command: format!("[legacy] {}", command.join(" ")),
-        next_client_id: AtomicU64::new(1),
-    });
+    let sess = Session::new(
+        Backend::Legacy(legacy),
+        format!("[legacy] {}", command.join(" ")),
+        policy,
+    );
 
     let reaper = sess.clone();
     std::thread::spawn(move || {
@@ -360,15 +542,16 @@ fn start_legacy(
         };
         let code = legacy.wait();
         log(&format!("legacy program exited with code {code}"));
-        reaper.broadcast(&ServerMsg::Exited(code));
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        std::process::exit(code);
+        reaper.finish(code);
     });
     Ok(sess)
 }
 
 /// Streams pty output into the terminal model and out to attached clients.
-fn spawn_pty_pump(sess: Arc<Session>, mut reader: Box<dyn Read + Send>) {
+fn spawn_pty_pump(
+    sess: Arc<Session>,
+    mut reader: Box<dyn Read + Send>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let Backend::Pty(pty) = &sess.backend else {
             return;
@@ -390,7 +573,7 @@ fn spawn_pty_pump(sess: Arc<Session>, mut reader: Box<dyn Read + Send>) {
                 }
             }
         }
-    });
+    })
 }
 
 /// Waits for the child and tears the session down when it exits.
@@ -403,10 +586,13 @@ fn spawn_child_reaper(sess: Arc<Session>, mut child: Box<dyn portable_pty::Child
                 -1
             }
         };
-        sess.broadcast(&ServerMsg::Exited(code));
-        // Let the per-client writer threads drain before the pipe disappears.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        std::process::exit(code);
+        if sess.keeps(code) {
+            // ConPTY can still be rendering the program's last output; a kept
+            // session exists to show it. The pipe never reaches EOF here (the
+            // pty stays open), so there is nothing better to wait on.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        sess.finish(code);
     });
 }
 
@@ -433,6 +619,12 @@ fn serve_client(sess: Arc<Session>, conn: PipeConn) -> Result<()> {
                     // then only subsequent output.
                     let screen = sess.repaint().unwrap_or(screen);
                     ServerMsg::Repaint(screen).write_to(&mut &*conn)?;
+                    // A kept session shows its last screen and how it ended,
+                    // then lets the client go: there is nothing left to drive.
+                    if let Some(code) = sess.exit_code() {
+                        ServerMsg::Exited(code).write_to(&mut &*conn)?;
+                        return Ok(());
+                    }
                     attached = Some(sess.attach(conn.clone()));
                 }
                 ClientMsg::Input(bytes) => sess.input(&bytes)?,
@@ -473,6 +665,7 @@ fn serve_client(sess: Arc<Session>, conn: PipeConn) -> Result<()> {
                         cols,
                         rows,
                         clients: sess.client_count(),
+                        exited: sess.exit_code(),
                         command: sess.command.clone(),
                     }
                     .write_to(&mut &*conn)?;

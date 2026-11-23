@@ -189,6 +189,61 @@ pub fn console_size() -> Size {
     }
 }
 
+/// `ALLOC_CONSOLE_OPTIONS` from consoleapi.h (Windows 11 24H2+).
+#[cfg(windows)]
+#[repr(C)]
+struct AllocConsoleOptions {
+    mode: i32,
+    use_show_window: i32,
+    show_window: u16,
+}
+
+/// `ALLOC_CONSOLE_MODE_DEFAULT`: a new console unless the parent asked for
+/// none with `DETACHED_PROCESS`.
+#[cfg(windows)]
+const ALLOC_CONSOLE_MODE_DEFAULT: i32 = 0;
+
+/// Gives this process the console it would have had without the manifest's
+/// `consoleAllocationPolicy=detached` (see `build.rs`).
+///
+/// The policy exists for `wmux com-server`, which COM starts with no console
+/// and must not get one. Every command that talks to a console calls this
+/// first, so run from Win+R, or with `CREATE_NEW_CONSOLE` (the legacy console
+/// host, the `--visible` viewer), it gets a console as before. A process that
+/// inherited one keeps it.
+///
+/// Windows before 24H2 ignores the policy and has already allocated the
+/// console, and has no `AllocConsoleWithOptions` either, so this does nothing
+/// there.
+#[cfg(windows)]
+pub fn ensure_console() {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    type AllocConsoleWithOptions =
+        unsafe extern "system" fn(*const AllocConsoleOptions, *mut i32) -> i32;
+
+    let kernel32: Vec<u16> = "kernel32.dll".encode_utf16().chain([0]).collect();
+    unsafe {
+        let module = GetModuleHandleW(kernel32.as_ptr());
+        if module.is_null() {
+            return;
+        }
+        let Some(proc) = GetProcAddress(module, c"AllocConsoleWithOptions".as_ptr().cast()) else {
+            return;
+        };
+        let alloc: AllocConsoleWithOptions = std::mem::transmute(proc);
+        let options = AllocConsoleOptions {
+            mode: ALLOC_CONSOLE_MODE_DEFAULT,
+            use_show_window: 0,
+            show_window: 0,
+        };
+        let mut result = 0;
+        alloc(&options, &mut result);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn ensure_console() {}
+
 #[cfg(not(windows))]
 pub struct RawMode;
 

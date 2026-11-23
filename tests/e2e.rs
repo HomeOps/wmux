@@ -219,10 +219,12 @@ fn a_new_session_is_discoverable_and_reports_its_geometry() {
             cols,
             rows,
             clients,
+            exited,
             command,
         } => {
             assert_eq!((cols, rows), (COLS, ROWS));
             assert_eq!(clients, 0, "an info query should not count as an attach");
+            assert_eq!(exited, None, "the shell is still running");
             assert!(command.contains("pwsh"), "unexpected command {command:?}");
         }
         other => panic!("expected an info reply, got {other:?}"),
@@ -776,5 +778,134 @@ fn killing_a_legacy_session_takes_the_program_with_it() {
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains(&marker),
         "cmd.exe outlived its session"
+    );
+}
+
+/// Polls `Info` until the session reports that its program has exited.
+fn wait_for_exit_code(name: &str, timeout: Duration) -> i32 {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let conn = connect(name);
+        ClientMsg::Info.write_to(&mut &*conn).expect("send info");
+        if let Ok(ServerMsg::InfoReply {
+            exited: Some(code), ..
+        }) = ServerMsg::read_from(&mut &*conn)
+        {
+            return code;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("session {name:?} never reported an exit within {timeout:?}");
+}
+
+fn wait_until_gone(name: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !session::session_exists(name).expect("list sessions") {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// What the default-terminal host relies on: nobody watches a handed-off
+/// program, so when it fails its session must stay, with its last screen,
+/// until someone attaches to read it or kills it.
+#[test]
+fn a_failed_program_is_kept_with_its_last_screen_until_killed() {
+    let exit_code = 3;
+    let script = format!(
+        "Write-Output ('KEPT'+'MARK'+{}); exit {exit_code}",
+        std::process::id()
+    );
+    let marker = format!("KEPTMARK{}", std::process::id());
+    let session = start_session_with(
+        "keepfail",
+        &["--keep-failed"],
+        &["pwsh.exe", "-NoLogo", "-NoProfile", "-Command", &script],
+    );
+
+    assert_eq!(wait_for_exit_code(&session.name, SHELL_TIMEOUT), exit_code);
+
+    let conn = connect(&session.name);
+    ClientMsg::Capture
+        .write_to(&mut &*conn)
+        .expect("send capture");
+    match ServerMsg::read_from(&mut &*conn).expect("read capture") {
+        ServerMsg::CaptureReply(text) => assert!(
+            text.contains(&marker),
+            "the kept screen should hold the program's output; it was:\n{text}"
+        ),
+        other => panic!("expected a capture reply, got {other:?}"),
+    }
+
+    // Attaching shows the final screen, then says how the program ended.
+    let conn = connect(&session.name);
+    let rx = spawn_reader(conn.clone());
+    ClientMsg::Attach {
+        cols: COLS,
+        rows: ROWS,
+    }
+    .write_to(&mut &*conn)
+    .expect("send attach");
+    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    let mut reported = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while reported.is_none() && Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ServerMsg::Repaint(bytes)) | Ok(ServerMsg::Output(bytes)) => parser.process(&bytes),
+            Ok(ServerMsg::Exited(code)) => reported = Some(code),
+            Ok(other) => panic!("unexpected message on attach: {other:?}"),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert_eq!(reported, Some(exit_code));
+    assert!(
+        parser.screen().contents().contains(&marker),
+        "attach should repaint the kept screen; it was:\n{}",
+        parser.screen().contents()
+    );
+
+    // Still there after the attach; gone after a kill.
+    assert!(session::session_exists(&session.name).expect("list sessions"));
+    ClientMsg::Kill
+        .write_to(&mut &*connect(&session.name))
+        .expect("send kill");
+    assert!(
+        wait_until_gone(&session.name, Duration::from_secs(10)),
+        "kill should remove a kept session"
+    );
+}
+
+#[test]
+fn a_program_that_succeeds_is_not_kept() {
+    let session = start_session_with(
+        "keepok",
+        &["--keep-failed"],
+        &["pwsh.exe", "-NoLogo", "-NoProfile", "-Command", "exit 0"],
+    );
+    assert!(
+        wait_until_gone(&session.name, SHELL_TIMEOUT),
+        "a session whose program exited 0 should disappear"
+    );
+}
+
+#[test]
+fn killing_a_running_program_is_not_kept_as_a_failure() {
+    // Killing ends the program with a non-zero code wmux chose itself; that
+    // must remove the session, not keep it as a failure.
+    let session = start_session_with(
+        "keepkill",
+        &["--keep-failed"],
+        &["pwsh.exe", "-NoLogo", "-NoProfile", "-NoExit"],
+    );
+    ClientMsg::Kill
+        .write_to(&mut &*connect(&session.name))
+        .expect("send kill");
+    assert!(
+        wait_until_gone(&session.name, Duration::from_secs(10)),
+        "a killed session should disappear even when it keeps failures"
     );
 }
