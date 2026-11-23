@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/HomeOps/wmux/compare/v0.5.2...v0.6.0) (2026-11-23)
+
+
+### Features
+
+* let wmux host console programs as the default terminal ([#19](https://github.com/HomeOps/wmux/issues/19)) ([bb7501b](https://github.com/HomeOps/wmux/commit/bb7501be54410990975af3ccb405f6fe3e23344f))
+
 ## [0.5.2](https://github.com/HomeOps/wmux/compare/v0.5.1...v0.5.2) (2026-11-22)
 
 
